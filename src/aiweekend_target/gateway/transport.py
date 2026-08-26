@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from aiweekend_target.errors import ErrorCode, TargetError
+from aiweekend_target.errors import ErrorCode, TargetError, classify_upstream_status
 from aiweekend_target.lab.config import BASE_MODEL, PROVIDER, ROUTER_URL
 
 from .policy import split_model_pair
@@ -39,15 +39,7 @@ def _headers(secret: str, accept: str) -> dict[str, str]:
 
 
 def _upstream_error(status_code: int) -> TargetError:
-    if status_code in {401, 403}:
-        code = ErrorCode.AUTH
-    elif status_code in {402, 429}:
-        code = ErrorCode.QUOTA
-    elif status_code == 404:
-        code = ErrorCode.MODEL_UNAVAILABLE
-    else:
-        code = ErrorCode.PROVIDER
-    return TargetError(code, "Hugging Face Router request failed", {"upstream_status": status_code})
+    return TargetError(classify_upstream_status(status_code), "Hugging Face Router request failed", {"upstream_status": status_code})
 
 
 def _provider_error() -> TargetError:

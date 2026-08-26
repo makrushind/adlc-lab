@@ -8,9 +8,8 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import re
 import sys
-from typing import Any, IO
+from typing import Any, Awaitable, Callable, IO
 from urllib.parse import urlsplit
 
 import httpx
@@ -18,41 +17,42 @@ import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from aiweekend_target.agent_protocol import (
+    ProtocolError,
+    TOOL_NAME,
+    parse_final_assistant,
+    parse_first_tool_turn,
+    strict_json,
+    validate_search_response,
+)
+from aiweekend_target.errors import ErrorCode, classify_upstream_status, local_response_status
 from aiweekend_target.lab.config import GATEWAY_BASE_URL, MCP_URL, MODEL_PAIR
 from aiweekend_target.lab.trace import CANARIES, TraceObserver, canaries_in, safe_preview
+from aiweekend_target.repo_rag.types import SearchResponse
 
 
 _SCENARIOS = frozenset({"baseline", "rag-poisoning", "mcp-poisoning", "llm-injection", "custom"})
-_GATEWAY_CODES = {"AUTH": 401, "QUOTA": 402, "MODEL_UNAVAILABLE": 404, "PROVIDER": 400, "POLICY": 400}
-_CALL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_AGENT_ERROR_CODES = frozenset({ErrorCode.AUTH.value, ErrorCode.QUOTA.value, ErrorCode.MODEL_UNAVAILABLE.value, ErrorCode.PROVIDER.value, ErrorCode.MCP.value, ErrorCode.POLICY.value})
 _MAX_TASK_BYTES = 65_536
-_MAX_PROMPT_PREVIEW = 240
-_MAX_QUERY = 256
-_MAX_PATH_GLOB = 256
-_MAX_ARGUMENTS = 4_096
-_MAX_RESULTS = 20
-_MAX_PATH = 512
 _MAX_CONTENT = 8_192
-_MAX_LINE = 1_000_000
-_TOOL_NAME = "search_repo"
 _TOOL_SCHEMA: dict[str, object] = {
     "type": "function",
     "function": {
-        "name": _TOOL_NAME,
+        "name": TOOL_NAME,
         "description": "Search the active repository corpus.",
         "parameters": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "query": {"type": "string", "minLength": 1, "maxLength": _MAX_QUERY},
+                "query": {"type": "string", "minLength": 1, "maxLength": 256},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 5},
-                "path_glob": {"type": ["string", "null"], "maxLength": _MAX_PATH_GLOB},
+                "path_glob": {"type": ["string", "null"], "maxLength": 256},
             },
             "required": ["query"],
         },
     },
 }
-_NAMED_TOOL_CHOICE = {"type": "function", "function": {"name": _TOOL_NAME}}
+_NAMED_TOOL_CHOICE = {"type": "function", "function": {"name": TOOL_NAME}}
 LLM_TIMEOUT = httpx.Timeout(connect=10.0, read=200.0, write=10.0, pool=10.0)
 
 
@@ -65,26 +65,9 @@ class AgentPaths:
 
 class _AgentFailure(Exception):
     def __init__(self, code: str, stage: str) -> None:
-        self.code = code if code in _GATEWAY_CODES or code == "MCP" else "POLICY"
+        self.code = code if code in _AGENT_ERROR_CODES else "POLICY"
         self.stage = stage
         super().__init__(self.code)
-
-
-def _json_pairs(items: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in items:
-        if key in result:
-            raise ValueError("duplicate JSON key")
-        result[key] = value
-    return result
-
-
-def _reject_constant(_: str) -> object:
-    raise ValueError("non-standard JSON number")
-
-
-def _strict_json(document: str) -> object:
-    return json.loads(document, object_pairs_hook=_json_pairs, parse_constant=_reject_constant)
 
 
 def _write_json(output: IO[str], value: Mapping[str, object]) -> None:
@@ -104,7 +87,7 @@ def _read_task(path: Path) -> str:
 
 def _scenario_id(path: Path) -> str:
     try:
-        value = _strict_json(path.read_text(encoding="utf-8"))
+        value = strict_json(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError) as error:
         raise _AgentFailure("POLICY", "prompt") from error
     if not isinstance(value, dict) or value.get("id") not in _SCENARIOS:
@@ -130,19 +113,13 @@ def _endpoint(name: str, default: str) -> str:
     return value
 
 
-def _text(value: object, maximum: int) -> str | None:
-    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > maximum:
-        return None
-    return value
-
-
 def _gateway_code(response: object) -> str | None:
     status = getattr(response, "status_code", None)
     text = getattr(response, "text", "")
     if not isinstance(status, int) or not isinstance(text, str) or len(text.encode("utf-8")) > _MAX_CONTENT:
         return None
     try:
-        value = _strict_json(text)
+        value = strict_json(text)
     except (UnicodeError, ValueError):
         return None
     if not isinstance(value, dict) or set(value) != {"ok", "error", "exit_code"}:
@@ -158,8 +135,11 @@ def _gateway_code(response: object) -> str | None:
         or (error.get("details") is not None and not isinstance(error.get("details"), dict))
     ):
         return None
-    code = error["code"]
-    return code if _GATEWAY_CODES.get(code) == status else None
+    try:
+        code = ErrorCode(error["code"])
+    except ValueError:
+        return None
+    return code.value if local_response_status(code) == status else None
 
 
 def _response_document(response: object, stage: str) -> dict[str, object]:
@@ -172,7 +152,7 @@ def _response_document(response: object, stage: str) -> dict[str, object]:
     if not isinstance(text, str) or len(text.encode("utf-8")) > _MAX_CONTENT:
         raise _AgentFailure("PROVIDER", stage)
     try:
-        value = _strict_json(text)
+        value = strict_json(text)
     except (UnicodeError, ValueError) as error:
         raise _AgentFailure("POLICY", stage) from error
     if not isinstance(value, dict):
@@ -181,102 +161,10 @@ def _response_document(response: object, stage: str) -> dict[str, object]:
 
 
 def _status_code(status: int) -> str:
-    return {401: "AUTH", 402: "QUOTA", 404: "MODEL_UNAVAILABLE"}.get(status, "PROVIDER")
+    return classify_upstream_status(status).value
 
 
-def _tool_arguments(value: object) -> dict[str, object]:
-    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > _MAX_ARGUMENTS:
-        raise _AgentFailure("POLICY", "llm")
-    try:
-        arguments = _strict_json(value)
-    except (UnicodeError, ValueError) as error:
-        raise _AgentFailure("POLICY", "llm") from error
-    if not isinstance(arguments, dict) or not set(arguments) <= {"query", "limit", "path_glob"}:
-        raise _AgentFailure("POLICY", "llm")
-    query = _text(arguments.get("query"), _MAX_QUERY)
-    limit = arguments.get("limit", 5)
-    path_glob = arguments.get("path_glob")
-    if query is None or not query.strip() or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 5:
-        raise _AgentFailure("POLICY", "llm")
-    if path_glob is not None and (_text(path_glob, _MAX_PATH_GLOB) is None or ".." in path_glob or path_glob.startswith("/")):
-        raise _AgentFailure("POLICY", "llm")
-    result: dict[str, object] = {"query": query.strip(), "limit": limit}
-    if path_glob is not None:
-        result["path_glob"] = path_glob
-    return result
-
-
-def _first_message(document: dict[str, object]) -> tuple[dict[str, object], dict[str, object], str, dict[str, object]]:
-    choices = document.get("choices")
-    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
-        raise _AgentFailure("POLICY", "llm")
-    message = choices[0].get("message")
-    if not isinstance(message, dict) or message.get("role") != "assistant":
-        raise _AgentFailure("POLICY", "llm")
-    content = message.get("content")
-    calls = message.get("tool_calls")
-    if (content not in (None, "")) or not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], dict):
-        raise _AgentFailure("POLICY", "llm")
-    call = calls[0]
-    function = call.get("function")
-    call_id = call.get("id")
-    if (
-        set(call) != {"id", "type", "function"}
-        or call.get("type") != "function"
-        or not isinstance(call_id, str)
-        or not _CALL_ID.fullmatch(call_id)
-        or not isinstance(function, dict)
-        or set(function) != {"name", "arguments"}
-        or function.get("name") != _TOOL_NAME
-    ):
-        raise _AgentFailure("POLICY", "llm")
-    arguments = _tool_arguments(function.get("arguments"))
-    canonical_call = {"id": call_id, "type": "function", "function": {"name": _TOOL_NAME, "arguments": function["arguments"]}}
-    assistant = {"role": "assistant", "content": content, "tool_calls": [canonical_call]}
-    return assistant, canonical_call, call_id, arguments
-
-
-def _final_text(document: dict[str, object]) -> str:
-    choices = document.get("choices")
-    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
-        raise _AgentFailure("POLICY", "llm")
-    message = choices[0].get("message")
-    if not isinstance(message, dict) or message.get("role") != "assistant" or message.get("tool_calls") not in (None, []):
-        raise _AgentFailure("POLICY", "llm")
-    content = _text(message.get("content"), _MAX_CONTENT)
-    if content is None or not content.strip():
-        raise _AgentFailure("POLICY", "llm")
-    return content.strip()
-
-
-def _validate_search(value: object) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) != {"results"} or not isinstance(value["results"], list) or len(value["results"]) > _MAX_RESULTS:
-        raise _AgentFailure("MCP", "mcp")
-    results: list[dict[str, object]] = []
-    for item in value["results"]:
-        if not isinstance(item, dict) or set(item) != {"path", "line_start", "line_end", "content"}:
-            raise _AgentFailure("MCP", "mcp")
-        path = _text(item.get("path"), _MAX_PATH)
-        content = _text(item.get("content"), _MAX_CONTENT)
-        start, end = item.get("line_start"), item.get("line_end")
-        if (
-            path is None
-            or content is None
-            or path.startswith("/")
-            or ".." in path.split("/")
-            or isinstance(start, bool)
-            or isinstance(end, bool)
-            or not isinstance(start, int)
-            or not isinstance(end, int)
-            or not 1 <= start <= end <= _MAX_LINE
-            or end - start > _MAX_LINE
-        ):
-            raise _AgentFailure("MCP", "mcp")
-        results.append({"path": path, "line_start": start, "line_end": end, "content": content})
-    return {"results": results}
-
-
-async def _mcp_search(url: str, arguments: dict[str, object]) -> dict[str, object]:
+async def _mcp_search(url: str, arguments: dict[str, object]) -> SearchResponse:
     try:
         async with httpx2.AsyncClient(follow_redirects=False, timeout=10.0, trust_env=False) as client:
             async with streamable_http_client(url, http_client=client) as (read_stream, write_stream):
@@ -286,20 +174,33 @@ async def _mcp_search(url: str, arguments: dict[str, object]) -> dict[str, objec
                     if (
                         getattr(listing, "result_type", None) != "complete"
                         or getattr(listing, "next_cursor", None) is not None
-                        or [getattr(tool, "name", None) for tool in getattr(listing, "tools", [])] != [_TOOL_NAME]
+                        or [getattr(tool, "name", None) for tool in getattr(listing, "tools", [])] != [TOOL_NAME]
                     ):
                         raise _AgentFailure("MCP", "mcp")
-                    result = await session.call_tool(_TOOL_NAME, arguments)
+                    result = await session.call_tool(TOOL_NAME, arguments)
                     if getattr(result, "result_type", None) != "complete" or getattr(result, "is_error", True):
                         raise _AgentFailure("MCP", "mcp")
-                    return _validate_search(getattr(result, "structured_content", None))
+                    try:
+                        return validate_search_response(getattr(result, "structured_content", None))
+                    except ProtocolError as error:
+                        raise _AgentFailure("MCP", "mcp") from error
     except _AgentFailure:
         raise
     except Exception as error:
         raise _AgentFailure("MCP", "mcp") from error
 
 
-async def _run(paths: AgentPaths, output: IO[str]) -> int:
+LLMPost = Callable[[str, dict[str, object]], Awaitable[object]]
+MCPSearch = Callable[[str, dict[str, object]], Awaitable[SearchResponse]]
+
+
+async def _run(
+    paths: AgentPaths,
+    output: IO[str],
+    *,
+    post_llm: LLMPost | None = None,
+    mcp_search: MCPSearch = _mcp_search,
+) -> int:
     scenario = "unknown"
     observer: TraceObserver | None = None
     try:
@@ -317,32 +218,47 @@ async def _run(paths: AgentPaths, output: IO[str]) -> int:
             "tool_choice": _NAMED_TOOL_CHOICE,
             "stream": False,
         }
-        _write_json(output, observer.emit("llm_request", turn=1, model=MODEL_PAIR, tool=_TOOL_NAME, status="sent"))
+        _write_json(output, observer.emit("llm_request", turn=1, model=MODEL_PAIR, tool=TOOL_NAME, status="sent"))
         try:
             async with httpx.AsyncClient(follow_redirects=False, timeout=LLM_TIMEOUT, trust_env=False) as client:
-                first_response = await client.post(llm_url, json=first_body)
+                if post_llm is None:
+                    async def send_llm(url: str, body: dict[str, object]) -> object:
+                        return await client.post(url, json=body)
+                else:
+                    send_llm = post_llm
+                first_response = await send_llm(llm_url, first_body)
                 first = _response_document(first_response, "llm")
-                assistant, call, call_id, arguments = _first_message(first)
-                _write_json(output, observer.emit("tool_call", turn=1, model=MODEL_PAIR, tool=_TOOL_NAME, query_preview=safe_preview(str(arguments["query"]), 160), status="accepted"))
-                _write_json(output, observer.emit("rag", stage="rag", query_preview=safe_preview(str(arguments["query"]), 160), status="prepared", canaries=canaries_in(arguments, allowed=CANARIES[:2])))
-                _write_json(output, observer.emit("mcp_request", tool=_TOOL_NAME, query_preview=safe_preview(str(arguments["query"]), 160), status="sent"))
-                search = await _mcp_search(mcp_url, arguments)
+                try:
+                    first_turn = parse_first_tool_turn(first)
+                except ProtocolError as error:
+                    raise _AgentFailure("POLICY", "llm") from error
+                _write_json(output, observer.emit("tool_call", turn=1, model=MODEL_PAIR, tool=TOOL_NAME, query_preview=safe_preview(str(first_turn.arguments["query"]), 160), status="accepted"))
+                _write_json(output, observer.emit("rag", stage="rag", query_preview=safe_preview(str(first_turn.arguments["query"]), 160), status="prepared", canaries=canaries_in(first_turn.arguments, allowed=CANARIES[:2])))
+                _write_json(output, observer.emit("mcp_request", tool=TOOL_NAME, query_preview=safe_preview(str(first_turn.arguments["query"]), 160), status="sent"))
+                search = await mcp_search(mcp_url, first_turn.arguments)
+                try:
+                    search = validate_search_response(search)
+                except ProtocolError as error:
+                    raise _AgentFailure("MCP", "mcp") from error
                 paths_preview = [safe_preview(str(item["path"]), 128) for item in search["results"][:10] if isinstance(item, dict)]
-                _write_json(output, observer.emit("mcp_result", stage="mcp", tool=_TOOL_NAME, result_count=len(search["results"]), paths=paths_preview, status="completed", canaries=canaries_in(search, allowed=CANARIES[:2])))
+                _write_json(output, observer.emit("mcp_result", stage="mcp", tool=TOOL_NAME, result_count=len(search["results"]), paths=paths_preview, status="completed", canaries=canaries_in(search, allowed=CANARIES[:2])))
                 second_body = {
                     "model": MODEL_PAIR,
                     "messages": [
                         {"role": "user", "content": prompt},
-                        assistant,
-                        {"role": "tool", "tool_call_id": call_id, "content": json.dumps(search, ensure_ascii=False, separators=(",", ":"))},
+                        first_turn.assistant,
+                        {"role": "tool", "tool_call_id": first_turn.call_id, "content": json.dumps(search, ensure_ascii=False, separators=(",", ":"))},
                     ],
                     "tools": [_TOOL_SCHEMA],
                     "tool_choice": "none",
                     "stream": False,
                 }
-                _write_json(output, observer.emit("llm_request", turn=2, model=MODEL_PAIR, tool=_TOOL_NAME, status="sent"))
-                second_response = await client.post(llm_url, json=second_body)
-                answer = _final_text(_response_document(second_response, "llm"))
+                _write_json(output, observer.emit("llm_request", turn=2, model=MODEL_PAIR, tool=TOOL_NAME, status="sent"))
+                second_response = await send_llm(llm_url, second_body)
+                try:
+                    answer = parse_final_assistant(_response_document(second_response, "llm"))
+                except ProtocolError as error:
+                    raise _AgentFailure("POLICY", "llm") from error
         except _AgentFailure:
             raise
         except httpx.HTTPError as error:

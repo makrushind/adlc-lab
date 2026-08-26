@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 import json
 import os
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Protocol, cast
 
 import anyio
 import httpx2
@@ -19,20 +19,18 @@ from aiweekend_target.errors import ErrorCode, TargetError
 from aiweekend_target.lab.scenarios import load_scenario
 from aiweekend_target.lab.trace import CANARIES, safe_preview
 from aiweekend_target.repo_rag.search import DATABASE_ENV, RepoSearch
+from aiweekend_target.repo_rag.types import SearchResponse, SearchResult
 
 
 DEFAULT_MARKER_PATH = Path("/target/rag-index/scenario.json")
 DEFAULT_SCENARIOS_ROOT = Path("/opt/adlc/scenarios")
 DEFAULT_LOOPBACK_URL = "http://127.0.0.1:8000/mcp"
-class SearchResult(TypedDict):
-    path: str
-    line_start: int
-    line_end: int
-    content: str
+class HealthSession(Protocol):
+    async def initialize(self) -> object: ...
 
+    async def list_tools(self) -> object: ...
 
-class SearchResponse(TypedDict):
-    results: list[SearchResult]
+    async def call_tool(self, name: str, arguments: dict[str, object]) -> object: ...
 
 
 def _mcp_error(message: str) -> TargetError:
@@ -177,18 +175,18 @@ async def health_check(
     return await health_session(LocalSession())
 
 
-async def health_session(session: object) -> dict[str, str]:
+async def health_session(session: HealthSession) -> dict[str, str]:
     """Perform the exact scenario-neutral initialize/list/call MCP health handshake."""
     try:
-        await session.initialize()  # type: ignore[attr-defined]
-        listing = await session.list_tools()  # type: ignore[attr-defined]
+        await session.initialize()
+        listing = await session.list_tools()
         if (
             getattr(listing, "result_type", None) != "complete"
             or getattr(listing, "next_cursor", None) is not None
             or [tool.name for tool in getattr(listing, "tools", [])] != ["search_repo"]
         ):
             raise _mcp_error("repo-rag health contract failed")
-        result = await session.call_tool("search_repo", {"query": "health", "limit": 1})  # type: ignore[attr-defined]
+        result = await session.call_tool("search_repo", {"query": "health", "limit": 1})
         if (
             getattr(result, "result_type", None) != "complete"
             or getattr(result, "is_error", True)
@@ -239,6 +237,7 @@ def serve(
 
 __all__ = [
     "ScenarioRepoSearch",
+    "HealthSession",
     "SearchResponse",
     "create_http_app",
     "create_server",

@@ -22,6 +22,32 @@ class ErrorCode(str, Enum):
     BUSY = "BUSY"
 
 
+_LOCAL_RESPONSE_STATUSES = {
+    ErrorCode.AUTH: 401,
+    ErrorCode.QUOTA: 402,
+    ErrorCode.MODEL_UNAVAILABLE: 404,
+    ErrorCode.PROVIDER: 400,
+    ErrorCode.POLICY: 400,
+    ErrorCode.CONFIG: 400,
+}
+
+
+def classify_upstream_status(status_code: int) -> ErrorCode:
+    """Classify an upstream HTTP status without changing local response semantics."""
+    if status_code in {401, 403}:
+        return ErrorCode.AUTH
+    if status_code in {402, 429}:
+        return ErrorCode.QUOTA
+    if status_code == 404:
+        return ErrorCode.MODEL_UNAVAILABLE
+    return ErrorCode.PROVIDER
+
+
+def local_response_status(code: ErrorCode) -> int:
+    """Return the stable HTTP status exposed by the local gateway for an error code."""
+    return _LOCAL_RESPONSE_STATUSES.get(code, 500)
+
+
 class TargetError(Exception):
     """An error with a machine-readable stable code and process status."""
 

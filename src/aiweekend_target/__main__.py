@@ -13,7 +13,7 @@ import httpx
 import uvicorn
 
 from aiweekend_target.agent import run_agent
-from aiweekend_target.errors import ErrorCode, TargetError
+from aiweekend_target.errors import ErrorCode, TargetError, local_response_status
 from aiweekend_target.gateway import create_app
 from aiweekend_target.lab.scenarios import LabPaths, load_scenario, reset_scenario, validate_scenarios
 from aiweekend_target.lab.token import manage_hf_token
@@ -29,14 +29,6 @@ _SCENARIOS_ROOT = Path("/opt/adlc/scenarios")
 _SCENARIO_REPOSITORY = _SCENARIOS_ROOT.parent
 _SECRET = Path("/run/secrets/hf_token")
 _GATEWAY_READY = "http://127.0.0.1:8080/health/ready"
-_GATEWAY_ERROR_STATUS = {
-    "AUTH": 401,
-    "QUOTA": 402,
-    "MODEL_UNAVAILABLE": 404,
-    "PROVIDER": 400,
-}
-
-
 def _write(output: IO[str], value: dict[str, object]) -> None:
     output.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
     output.flush()
@@ -86,6 +78,10 @@ def _health(service: str) -> None:
             return
         if isinstance(payload, dict) and set(payload) == {"ok", "error", "exit_code"}:
             failure = payload.get("error")
+            try:
+                failure_code = ErrorCode(failure["code"]) if isinstance(failure, dict) and isinstance(failure.get("code"), str) else None
+            except ValueError:
+                failure_code = None
             if (
                 payload.get("ok") is False
                 and payload.get("exit_code") == 1
@@ -93,9 +89,10 @@ def _health(service: str) -> None:
                 and set(failure) == {"code", "message", "details"}
                 and isinstance(failure.get("code"), str)
                 and isinstance(failure.get("message"), str)
-                and _GATEWAY_ERROR_STATUS.get(failure["code"]) == response.status_code
+                and failure_code is not None
+                and local_response_status(failure_code) == response.status_code
             ):
-                raise TargetError(ErrorCode(failure["code"]), "gateway readiness contract failed")
+                raise TargetError(failure_code, "gateway readiness contract failed")
         raise TargetError(ErrorCode.PROVIDER, "gateway readiness contract failed")
     raise TargetError(ErrorCode.CONFIG, "health service is not recognized")
 

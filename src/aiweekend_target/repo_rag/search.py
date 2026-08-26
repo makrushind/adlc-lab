@@ -8,9 +8,8 @@ import re
 import sqlite3
 from contextlib import closing
 from pathlib import PurePosixPath
-from typing import Any
-
 from aiweekend_target.errors import ErrorCode, TargetError
+from aiweekend_target.repo_rag.types import SearchResponse
 
 DATABASE_ENV = "AIWEEKEND_REPO_RAG_DB"
 _TOKEN = re.compile(r"\w+", re.UNICODE)
@@ -22,7 +21,7 @@ class RepoSearch:
     def __init__(self, database_path: str | os.PathLike[str]) -> None:
         self.database_path = os.fspath(database_path)
 
-    def search_repo(self, query: str, limit: int = 5, path_glob: str | None = None) -> dict[str, list[dict[str, Any]]]:
+    def search_repo(self, query: str, limit: int = 5, path_glob: str | None = None) -> SearchResponse:
         _validate_arguments(query, limit, path_glob)
         expression = _query_expression(query)
         if not expression:
@@ -44,7 +43,7 @@ class RepoSearch:
         return {"results": results[:limit]}
 
 
-def search_repo(query: str, limit: int = 5, path_glob: str | None = None) -> dict[str, list[dict[str, Any]]]:
+def search_repo(query: str, limit: int = 5, path_glob: str | None = None) -> SearchResponse:
     """Search the database named by ``AIWEEKEND_REPO_RAG_DB``."""
     database_path = os.environ.get(DATABASE_ENV)
     if not database_path:

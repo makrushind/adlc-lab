@@ -13,7 +13,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from aiweekend_target.errors import ErrorCode, TargetError
+from aiweekend_target.errors import TargetError, local_response_status
 from aiweekend_target.lab.config import MODEL_PAIR, PROVIDER
 
 from .policy import read_secret, validate_chat_body
@@ -24,15 +24,7 @@ DEFAULT_SECRET_PATH = "/run/secrets/hf_token"
 
 
 def _error_response(error: TargetError) -> JSONResponse:
-    statuses = {
-        ErrorCode.AUTH: 401,
-        ErrorCode.QUOTA: 402,
-        ErrorCode.MODEL_UNAVAILABLE: 404,
-        ErrorCode.POLICY: 400,
-        ErrorCode.CONFIG: 400,
-        ErrorCode.PROVIDER: 400,
-    }
-    return JSONResponse(error.as_result(), status_code=statuses.get(error.code, 500))
+    return JSONResponse(error.as_result(), status_code=local_response_status(error.code))
 
 
 def create_app(
