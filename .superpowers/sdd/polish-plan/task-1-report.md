@@ -6,7 +6,7 @@
 - Preserved the public `run_agent()` signature and production Compose behavior: exactly two LLM posts, one MCP call, no retry/fallback, pinned `openai/gpt-oss-20b:groq` request bodies, and the ten-event success sequence.
 - Centralized upstream HTTP classification and canonical local response statuses in `errors.py`; the gateway, transport, agent, and readiness wrapper now use them.
 - Replaced the agent's tuple turn result with `FirstToolTurn`, moved repo-RAG result shapes into shared TypedDicts, and introduced the `HealthSession` protocol.
-- Added 11 public `unittest` behavior tests for taxonomy, the exact runtime loop/event order, malformed peer documents, gateway readiness wrapping, scenarios, and trace redaction/stages.
+- Added 16 public `unittest` behavior tests for taxonomy, the exact runtime loop/event order, bounded failure paths, malformed peer documents, gateway readiness wrapping, scenarios, and trace redaction/stages.
 
 ## RED evidence
 
@@ -63,3 +63,38 @@ $ git diff --check
 
 - Docker is unavailable in this environment, so Compose execution was not possible here. Unit and source-compilation verification ran in a temporary environment using the declared runtime dependency versions.
 - `requirements.lock` currently rejects the available macOS ARM `cffi==2.1.1` wheel hash. The temporary environment therefore used `requirements.in`; no dependency or lockfile was changed.
+
+## Amendment — strengthened failure-path coverage
+
+Added four focused agent behavior tests. They assert that a failed first LLM response makes one LLM call and zero MCP calls; a failed second response makes two LLM calls and one MCP call; a malformed MCP response makes one LLM call and one MCP call; and a malformed final assistant response makes two LLM calls and one MCP call. Each asserts a terminal false `lab_result` and the applicable `PROVIDER`, `MCP`, or `POLICY` error code. The taxonomy suite now also covers `404 -> MODEL_UNAVAILABLE` and `500 -> PROVIDER`.
+
+Mutation check (the mutation was restored and never committed):
+
+```text
+$ apply_patch  # temporarily return POLICY from agent._status_code
+$ TASK_VENV=/private/tmp/adlc-task1-venv PYTHONPATH=src "$TASK_VENV/bin/python" -m unittest tests.test_agent.AgentLoopTests.test_first_llm_failure_stops_without_retry_or_mcp_fallback tests.test_agent.AgentLoopTests.test_second_llm_failure_stops_without_retry_or_fallback -v
+Ran 2 tests in 0.022s
+FAILED (failures=2)
+
+AssertionError: 'POLICY' != 'PROVIDER'
+```
+
+After restoring `classify_upstream_status(status).value`:
+
+```text
+$ TASK_VENV=/private/tmp/adlc-task1-venv PYTHONPATH=src "$TASK_VENV/bin/python" -m unittest tests.test_agent tests.test_errors -v
+Ran 9 tests in 0.034s
+OK
+
+$ TASK_VENV=/private/tmp/adlc-task1-venv PYTHONPATH=src "$TASK_VENV/bin/python" -m unittest discover -s tests -v
+Ran 16 tests in 0.039s
+OK
+
+$ TASK_VENV=/private/tmp/adlc-task1-venv PYTHONPATH=src "$TASK_VENV/bin/python" -c '<in-memory compile all src and tests>'
+compiled 24 Python sources in memory
+
+$ git diff --check
+(no output; passed)
+```
+
+`gateway/policy.py`, `lab/scenarios.py`, `lab/trace.py`, and `pyproject.toml` were intentionally unchanged: the extracted protocol/types and focused behavior tests required no production modification to those already-correct boundaries or project metadata.

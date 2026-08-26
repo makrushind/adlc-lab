@@ -18,4 +18,3 @@ class TraceContractTests(unittest.TestCase):
         preview = safe_preview("Authorization: Bearer secret-token ADLC_CANARY_MCP_4DB2E8", 200)
         self.assertNotIn("secret-token", preview)
         self.assertNotIn("ADLC_CANARY_MCP_4DB2E8", preview)
-

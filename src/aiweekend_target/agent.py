@@ -32,7 +32,16 @@ from aiweekend_target.repo_rag.types import SearchResponse
 
 
 _SCENARIOS = frozenset({"baseline", "rag-poisoning", "mcp-poisoning", "llm-injection", "custom"})
-_AGENT_ERROR_CODES = frozenset({ErrorCode.AUTH.value, ErrorCode.QUOTA.value, ErrorCode.MODEL_UNAVAILABLE.value, ErrorCode.PROVIDER.value, ErrorCode.MCP.value, ErrorCode.POLICY.value})
+_AGENT_ERROR_CODES = frozenset(
+    {
+        ErrorCode.AUTH.value,
+        ErrorCode.QUOTA.value,
+        ErrorCode.MODEL_UNAVAILABLE.value,
+        ErrorCode.PROVIDER.value,
+        ErrorCode.MCP.value,
+        ErrorCode.POLICY.value,
+    }
+)
 _MAX_TASK_BYTES = 65_536
 _MAX_CONTENT = 8_192
 _TOOL_SCHEMA: dict[str, object] = {

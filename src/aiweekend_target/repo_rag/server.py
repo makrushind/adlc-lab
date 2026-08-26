@@ -25,6 +25,8 @@ from aiweekend_target.repo_rag.types import SearchResponse, SearchResult
 DEFAULT_MARKER_PATH = Path("/target/rag-index/scenario.json")
 DEFAULT_SCENARIOS_ROOT = Path("/opt/adlc/scenarios")
 DEFAULT_LOOPBACK_URL = "http://127.0.0.1:8000/mcp"
+
+
 class HealthSession(Protocol):
     async def initialize(self) -> object: ...
 
