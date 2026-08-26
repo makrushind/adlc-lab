@@ -15,7 +15,10 @@ ADLC Lab — учебная лаборатория для наблюдения �
 - Docker Engine или Docker Desktop с Linux-контейнерами и Docker Compose v2;
 - не менее 2 CPU, 4 ГиБ RAM и 10 ГиБ свободного места;
 - Hugging Face token с доступными credits и исходящий HTTPS-доступ к Hugging
-  Face Router.
+  Face Router;
+- исходящий доступ к настроенному container registry: при первой сборке Docker
+  получает оттуда frontend Dockerfile и базовый образ Python, а также доступ к
+  PyPI для зафиксированных Python-пакетов.
 
 Локальный Python, virtualenv и установка Python-зависимостей не нужны: всё
 выполняется в контейнерах. Проверка Docker должна напечатать обе версии:
@@ -37,8 +40,9 @@ docker compose build
 ```
 
 `docker compose config --quiet` завершается с кодом 0 и ничего не печатает;
-`docker compose build` создаёт локальные образы `adlc-lab-*`. Сборка скачивает
-зафиксированные Python-пакеты, поэтому для неё нужен доступ к PyPI.
+`docker compose build` создаёт локальные образы `adlc-lab-*`. При первой
+сборке Docker получает frontend Dockerfile и базовый Python-образ из container
+registry, затем скачивает зафиксированные Python-пакеты с PyPI.
 
 Создайте token один раз:
 
@@ -51,9 +55,11 @@ docker compose run --rm setup-token
 сохраняется на хосте в `.lab/secrets/hf_token` и монтируется только в
 `hf-gateway`.
 
-Внимание: каждый запуск `agent` выполняет ровно два live-вызова модели и
-расходует Hugging Face credits. Стоимость зависит от вашего аккаунта и
-провайдера; не запускайте сценарии многократно без необходимости.
+Внимание: успешный запуск `agent` выполняет ровно два billable live-вызова
+модели и расходует Hugging Face credits. Аварийный запуск без повторов может
+остановиться до первого вызова или после первого, то есть сделать ноль либо
+один live-вызов. Стоимость зависит от вашего аккаунта и провайдера; не
+запускайте сценарии многократно без необходимости.
 
 ## Baseline: первый успешный запуск
 
@@ -69,8 +75,11 @@ docker compose run --rm agent
 Ожидаемые результаты:
 
 - `reset` печатает ровно `{"ok":true,"reset":true,"scenario":"baseline"}`;
-- `docker compose ps` показывает `repo-rag` и `hf-gateway` со статусом
-  `running (healthy)`;
+- `docker compose up -d --wait repo-rag hf-gateway` завершается с кодом 0;
+  это проверка готовности обоих сервисов. В выводе `docker compose ps` должны
+  быть `repo-rag` и `hf-gateway` с признаком `healthy`; оформление таблицы
+  (`Up`, `running` и другое) зависит от версии Compose и не является
+  контрактом;
 - `agent` печатает ровно десять JSONL-строк в порядке ниже, а его последняя
   строка — точный маркер PASS:
 
@@ -166,7 +175,7 @@ redaction и Compose override для внешнего detector — в
 | Наблюдение | Вероятная причина | Действие |
 | --- | --- | --- |
 | `docker compose` не найден или Docker не запускается | Compose v2/daemon недоступен | Установите или запустите Docker Desktop/Engine и повторите проверки из «Что потребуется». |
-| `docker compose build` завершается ошибкой | Нет сети к PyPI, мало места или ресурсов Docker | Проверьте доступ в сеть, 10 ГиБ места и лимиты Docker; затем повторите `docker compose build`. |
+| `docker compose build` завершается ошибкой | Нет доступа к container registry или PyPI, мало места или ресурсов Docker | Проверьте доступ к registry и PyPI, 10 ГиБ места и лимиты Docker; затем повторите `docker compose build`. |
 | `setup-token` сообщает, что secret уже существует | Token нельзя перезаписать | Выполните `docker compose run --rm setup-token delete`, затем снова `docker compose run --rm setup-token`. |
 | `hf-gateway` не становится healthy | Token, credits, модель или сеть недоступны | Выполните `docker compose logs hf-gateway`. Код `AUTH` означает неверный/недоступный token, `QUOTA` — закончились credits, `MODEL_UNAVAILABLE` — недоступна модель, `PROVIDER` — сбой сети или провайдера. |
 | `agent` завершился с кодом 1 | Последние JSONL-строки содержат `agent_error` | При `MCP` повторите `reset` и запуск `repo-rag`; при `POLICY` проверьте выбранный сценарий и custom payload; при `AUTH`/`QUOTA`/`MODEL_UNAVAILABLE`/`PROVIDER` используйте действие из предыдущей строки. |
