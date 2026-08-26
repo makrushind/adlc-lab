@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
-import json
 from typing import Any
 
 import httpx
 
-from aiweekend_target.errors import ErrorCode, TargetError
+from aiweekend_target.errors import ErrorCode, TargetError, classify_upstream_status
 from aiweekend_target.lab.config import BASE_MODEL, PROVIDER, ROUTER_URL
-
-from .policy import split_model_pair
-
 
 CHAT_URL = f"{ROUTER_URL}/chat/completions"
 PROBE_TIMEOUT = httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)
@@ -39,15 +36,7 @@ def _headers(secret: str, accept: str) -> dict[str, str]:
 
 
 def _upstream_error(status_code: int) -> TargetError:
-    if status_code in {401, 403}:
-        code = ErrorCode.AUTH
-    elif status_code in {402, 429}:
-        code = ErrorCode.QUOTA
-    elif status_code == 404:
-        code = ErrorCode.MODEL_UNAVAILABLE
-    else:
-        code = ErrorCode.PROVIDER
-    return TargetError(code, "Hugging Face Router request failed", {"upstream_status": status_code})
+    return TargetError(classify_upstream_status(status_code), "Hugging Face Router request failed", {"upstream_status": status_code})
 
 
 def _provider_error() -> TargetError:

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
 import re
+from collections.abc import Mapping
 
 
 CANARIES = (
@@ -17,18 +16,6 @@ _STAGES = ("prompt", "rag", "mcp", "llm", "agent")
 _SECRET_PREVIEW = re.compile(
     r"(?i)\b(?:authorization|proxy-authorization|x-api-key|api-key|cookie|set-cookie|x-auth-token|token|secret|password)\s*[:=]\s*[^\r\n]+|\bbearer\s+[^\s,;]+|\bhf_[A-Za-z0-9_-]+"
 )
-
-
-@dataclass(frozen=True)
-class LabTraceEvent:
-    """Compatibility shape for consumers that import the trace event type."""
-
-    schema: int
-    type: str
-    scenario: str
-    stage: str
-    status: str
-    canaries: tuple[str, ...]
 
 
 def canaries_in(value: object, *, allowed: tuple[str, ...] = CANARIES) -> list[str]:
@@ -97,4 +84,4 @@ class TraceObserver:
         }
 
 
-__all__ = ["CANARIES", "LabTraceEvent", "TraceObserver", "canaries_in", "safe_preview"]
+__all__ = ["CANARIES", "TraceObserver", "canaries_in", "safe_preview"]

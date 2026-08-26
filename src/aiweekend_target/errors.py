@@ -10,16 +10,74 @@ from typing import Any
 
 class ErrorCode(str, Enum):
     CONFIG = "CONFIG"
-    BUILD = "BUILD"
-    RESOURCE = "RESOURCE"
     AUTH = "AUTH"
     QUOTA = "QUOTA"
     PROVIDER = "PROVIDER"
     MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
     MCP = "MCP"
     POLICY = "POLICY"
-    TEST = "TEST"
-    BUSY = "BUSY"
+
+
+_LOCAL_RESPONSE_STATUSES = {
+    ErrorCode.AUTH: 401,
+    ErrorCode.QUOTA: 402,
+    ErrorCode.MODEL_UNAVAILABLE: 404,
+    ErrorCode.PROVIDER: 400,
+    ErrorCode.POLICY: 400,
+    ErrorCode.CONFIG: 400,
+}
+_GATEWAY_CHAT_ERROR_STATUSES = {
+    ErrorCode.AUTH: 401,
+    ErrorCode.QUOTA: 402,
+    ErrorCode.MODEL_UNAVAILABLE: 404,
+    ErrorCode.PROVIDER: 400,
+    ErrorCode.POLICY: 400,
+}
+_GATEWAY_READINESS_ERROR_STATUSES = {
+    ErrorCode.AUTH: 401,
+    ErrorCode.QUOTA: 402,
+    ErrorCode.MODEL_UNAVAILABLE: 404,
+    ErrorCode.PROVIDER: 400,
+}
+
+
+def classify_upstream_status(status_code: int) -> ErrorCode:
+    """Classify an upstream HTTP status without changing local response semantics."""
+    if status_code in {401, 403}:
+        return ErrorCode.AUTH
+    if status_code in {402, 429}:
+        return ErrorCode.QUOTA
+    if status_code == 404:
+        return ErrorCode.MODEL_UNAVAILABLE
+    return ErrorCode.PROVIDER
+
+
+def local_response_status(code: ErrorCode) -> int:
+    """Return the stable HTTP status exposed by the local gateway for an error code."""
+    return _LOCAL_RESPONSE_STATUSES.get(code, 500)
+
+
+def match_gateway_error(document: object, status_code: object, *, readiness: bool = False) -> ErrorCode | None:
+    """Return a canonical peer-gateway code only for an exact allowed document."""
+    if type(status_code) is not int or not isinstance(document, dict) or set(document) != {"ok", "error", "exit_code"}:
+        return None
+    error = document.get("error")
+    if (
+        document.get("ok") is not False
+        or type(document.get("exit_code")) is not int
+        or document["exit_code"] != 1
+        or not isinstance(error, dict)
+        or set(error) != {"code", "message", "details"}
+        or not isinstance(error.get("code"), str)
+        or not isinstance(error.get("message"), str)
+        or (error.get("details") is not None and not isinstance(error.get("details"), dict))
+    ):
+        return None
+    allowed = _GATEWAY_READINESS_ERROR_STATUSES if readiness else _GATEWAY_CHAT_ERROR_STATUSES
+    for code, expected_status in allowed.items():
+        if error["code"] == code.value and status_code == expected_status:
+            return code
+    return None
 
 
 class TargetError(Exception):

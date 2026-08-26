@@ -1,6 +1,7 @@
 .env
 .lab/
 .sdd/
+.superpowers/
 .venv/
 __pycache__/
 *.py[cod]
