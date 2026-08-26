@@ -59,12 +59,13 @@ def local_response_status(code: ErrorCode) -> int:
 
 def match_gateway_error(document: object, status_code: object, *, readiness: bool = False) -> ErrorCode | None:
     """Return a canonical peer-gateway code only for an exact allowed document."""
-    if not isinstance(status_code, int) or not isinstance(document, dict) or set(document) != {"ok", "error", "exit_code"}:
+    if type(status_code) is not int or not isinstance(document, dict) or set(document) != {"ok", "error", "exit_code"}:
         return None
     error = document.get("error")
     if (
         document.get("ok") is not False
-        or document.get("exit_code") != 1
+        or type(document.get("exit_code")) is not int
+        or document["exit_code"] != 1
         or not isinstance(error, dict)
         or set(error) != {"code", "message", "details"}
         or not isinstance(error.get("code"), str)

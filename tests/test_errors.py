@@ -35,3 +35,9 @@ class ErrorClassificationTests(unittest.TestCase):
         policy_error = {"ok": False, "error": {"code": "POLICY", "message": "invalid request", "details": None}, "exit_code": 1}
         self.assertIsNone(match_gateway_error(policy_error, 400, readiness=True))
         self.assertIsNone(match_gateway_error({"ok": False, "error": {"code": "AUTH"}, "exit_code": 1}, 401, readiness=True))
+
+    def test_gateway_matcher_rejects_boolean_integer_fields(self) -> None:
+        document = {"ok": False, "error": {"code": "POLICY", "message": "invalid request", "details": None}, "exit_code": 1}
+        boolean_exit_code = {**document, "exit_code": True}
+        self.assertIsNone(match_gateway_error(boolean_exit_code, 400))
+        self.assertIsNone(match_gateway_error(document, True))

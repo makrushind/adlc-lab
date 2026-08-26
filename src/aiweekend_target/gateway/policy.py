@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from aiweekend_target.errors import ErrorCode, TargetError
-from aiweekend_target.lab.config import MODEL_PAIR
 
 
 ROUTING_INJECTION_FIELDS = frozenset(
