@@ -1,0 +1,100 @@
+"""Deterministically build the SQLite FTS index used by repo-rag."""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import tempfile
+from pathlib import Path
+
+from aiweekend_target.errors import ErrorCode, TargetError
+
+CHUNK_LINES = 40
+CHUNK_OVERLAP = 10
+
+
+def build_index(corpus_root: str | Path, database_path: str | Path) -> None:
+    """Atomically replace *database_path* with an index of *corpus_root*."""
+    root = Path(corpus_root)
+    target = Path(database_path)
+    try:
+        _validate_corpus_root(root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except TargetError:
+        raise
+    except OSError as error:
+        raise TargetError(ErrorCode.MCP, "unable to prepare repository index") from error
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent, delete=False
+        ) as temporary:
+            temporary_name = temporary.name
+        connection = sqlite3.connect(temporary_name)
+        try:
+            connection.execute(
+                "CREATE VIRTUAL TABLE chunks USING fts5("
+                "path UNINDEXED, line_start UNINDEXED, line_end UNINDEXED, content)"
+            )
+            for source in _source_files(root):
+                relative = source.relative_to(root).as_posix()
+                try:
+                    lines = source.read_text(encoding="utf-8").splitlines()
+                except UnicodeDecodeError as error:
+                    raise TargetError(ErrorCode.MCP, "corpus file is not UTF-8", {"path": relative}) from error
+                for line_start, line_end, content in _chunks(lines):
+                    connection.execute(
+                        "INSERT INTO chunks(path, line_start, line_end, content) VALUES (?, ?, ?, ?)",
+                        (relative, line_start, line_end, content),
+                    )
+            connection.commit()
+        finally:
+            connection.close()
+        os.replace(temporary_name, target)
+        temporary_name = None
+    except TargetError:
+        raise
+    except (OSError, sqlite3.Error) as error:
+        raise TargetError(ErrorCode.MCP, "unable to rebuild repository index") from error
+    finally:
+        if temporary_name is not None:
+            try:
+                Path(temporary_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _validate_corpus_root(root: Path) -> None:
+    if not root.is_dir():
+        raise TargetError(ErrorCode.MCP, "corpus root is not a directory")
+    if any(ancestor.is_symlink() for ancestor in (root, *root.parents)):
+        raise TargetError(ErrorCode.POLICY, "corpus root must not be a symlink")
+
+
+def _source_files(root: Path) -> list[Path]:
+    sources: list[Path] = []
+    resolved_root = root.resolve(strict=True)
+    for source in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        if source.is_symlink():
+            raise TargetError(ErrorCode.POLICY, "corpus entries must not be symlinks", {"path": str(source)})
+        if source.is_file():
+            try:
+                source.resolve(strict=True).relative_to(resolved_root)
+            except ValueError as error:
+                raise TargetError(ErrorCode.POLICY, "corpus entry escapes its root", {"path": str(source)}) from error
+            sources.append(source)
+    return sources
+
+
+def _chunks(lines: list[str]) -> list[tuple[int, int, str]]:
+    if not lines:
+        return []
+    step = CHUNK_LINES - CHUNK_OVERLAP
+    chunks: list[tuple[int, int, str]] = []
+    for start in range(0, len(lines), step):
+        if chunks and chunks[-1][1] == len(lines):
+            break
+        chunks.append(
+            (start + 1, min(start + CHUNK_LINES, len(lines)), "\n".join(lines[start : start + CHUNK_LINES]))
+        )
+    return chunks

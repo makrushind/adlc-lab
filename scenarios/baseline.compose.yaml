@@ -1,0 +1,4 @@
+services:
+  reset:
+    environment:
+      LAB_SCENARIO: baseline

@@ -1,0 +1,147 @@
+name: release-gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-gate:
+    name: release-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Validate base and scenario Compose models
+        run: |
+          docker compose config --quiet
+          for overlay in baseline rag-poisoning mcp-poisoning llm-injection custom; do
+            docker compose -f compose.yaml -f "scenarios/${overlay}.compose.yaml" config --quiet
+          done
+
+      - name: Build the three native images once
+        run: docker compose build agent repo-rag hf-gateway
+
+      - name: Validate all fixed scenario fixtures
+        run: docker compose run --rm --no-deps -T reset validate-scenarios
+
+      - name: Assert the resolved isolation model
+        run: |
+          docker compose --profile tools config --format json --no-path-resolution > /tmp/adlc-base.json
+          for overlay in baseline rag-poisoning mcp-poisoning llm-injection custom; do
+            docker compose --profile tools -f compose.yaml -f "scenarios/${overlay}.compose.yaml" config --format json --no-path-resolution > "/tmp/adlc-${overlay}.json"
+          done
+          python3 - <<'PY'
+          import copy
+          import json
+          from pathlib import Path
+
+          base = json.loads(Path("/tmp/adlc-base.json").read_text(encoding="utf-8"))
+          custom = json.loads(Path("/tmp/adlc-custom.json").read_text(encoding="utf-8"))
+          expected_scenarios = ("baseline", "rag-poisoning", "mcp-poisoning", "llm-injection", "custom")
+          resolved_scenarios = {
+              scenario: json.loads(Path(f"/tmp/adlc-{scenario}.json").read_text(encoding="utf-8"))
+              for scenario in expected_scenarios
+          }
+          services = base["services"]
+          core = {"reset", "repo-rag", "hf-gateway", "agent"}
+          expected_services = core | {"setup-token"}
+          expected_volumes = {"workspace", "corpus", "rag_index"}
+          if set(services) != expected_services or set(base.get("volumes", {})) != expected_volumes:
+              raise SystemExit("unexpected lab roles or volumes")
+          if set(base.get("networks", {})) != {"internal", "egress"} or not base["networks"]["internal"].get("internal"):
+              raise SystemExit("unexpected lab networks")
+          if set(base.get("secrets", {})) != {"hf_token"}:
+              raise SystemExit("unexpected lab secrets")
+
+          reference = copy.deepcopy(base)
+          reference["services"]["reset"].get("environment", {}).pop("LAB_SCENARIO", None)
+          for scenario, resolved in resolved_scenarios.items():
+              selected = resolved["services"]["reset"].get("environment", {}).get("LAB_SCENARIO")
+              if selected != scenario:
+                  raise SystemExit(f"scenario overlay mismatch: {scenario!r} selected {selected!r}")
+              normalized = copy.deepcopy(resolved)
+              normalized["services"]["reset"].get("environment", {}).pop("LAB_SCENARIO", None)
+              binds = [mount for mount in normalized["services"]["reset"].get("volumes", []) if mount.get("type") == "bind"]
+              if scenario == "custom":
+                  if len(binds) != 1:
+                      raise SystemExit("custom overlay bind count mismatch")
+                  normalized["services"]["reset"]["volumes"].remove(binds[0])
+              elif binds:
+                  raise SystemExit(f"unexpected bind in {scenario!r}")
+              if normalized != reference:
+                  raise SystemExit(f"overlay changes more than its scenario fixture: {scenario!r}")
+
+          build_targets = {
+              service["build"]["target"]
+              for service in services.values()
+              if isinstance(service.get("build"), dict)
+          }
+          if build_targets != {"agent-runtime", "repo-rag", "hf-gateway"}:
+              raise SystemExit("unexpected image targets")
+          if not (services["agent"]["image"] == services["reset"]["image"] == services["setup-token"]["image"]):
+              raise SystemExit("agent utility image is not shared")
+          if services["agent"].get("environment") != {
+              "ADLC_MCP_URL": "http://repo-rag:8000/mcp",
+              "ADLC_LLM_URL": "http://hf-gateway:8080/v1/chat/completions",
+          }:
+              raise SystemExit("agent endpoint boundary mismatch")
+
+          for name, service in services.items():
+              networks = set(service.get("networks", {}))
+              secrets = {
+                  item.get("source") if isinstance(item, dict) else item
+                  for item in service.get("secrets", [])
+              }
+              if ("egress" in networks) != (name == "hf-gateway"):
+                  raise SystemExit(f"egress mismatch for {name}")
+              if secrets != ({"hf_token"} if name == "hf-gateway" else set()):
+                  raise SystemExit(f"secret mismatch for {name}")
+              if service.get("ports") or service.get("privileged"):
+                  raise SystemExit(f"unsafe service setting for {name}")
+              mounts = service.get("volumes", [])
+              if "docker.sock" in json.dumps(mounts, sort_keys=True):
+                  raise SystemExit(f"host socket mounted by {name}")
+          if any(services[name].get("user") != "10001:10001" for name in core):
+              raise SystemExit("core role is not non-root")
+          if services["setup-token"].get("user") != "0:0":
+              raise SystemExit("setup-token user mismatch")
+          if services["reset"].get("network_mode") != "none" or services["setup-token"].get("network_mode") != "none":
+              raise SystemExit("offline utility network mismatch")
+
+          base_binds = [
+              (name, mount)
+              for name, service in services.items()
+              for mount in service.get("volumes", [])
+              if mount.get("type") == "bind"
+          ]
+          if len(base_binds) != 1 or base_binds[0][0] != "setup-token" or base_binds[0][1].get("target") != "/host-lab":
+              raise SystemExit("unexpected base host bind")
+          custom_binds = [mount for mount in custom["services"]["reset"].get("volumes", []) if mount.get("type") == "bind"]
+          if (
+              len(custom_binds) != 1
+              or custom_binds[0].get("target") != "/opt/adlc/scenarios/custom/payload.txt"
+              or not custom_binds[0].get("read_only")
+          ):
+              raise SystemExit("custom payload bind mismatch")
+
+          root = Path(".")
+          retired = "open" + "code"
+          if any(retired in path.name.lower() for path in root.rglob("*")):
+              raise SystemExit("retired runtime artifact remains")
+          if any(
+              path.is_file()
+              and retired in path.read_text(encoding="utf-8", errors="ignore").lower()
+              for path in root.rglob("*")
+              if "__pycache__" not in path.parts and path.suffix != ".pyc"
+          ):
+              raise SystemExit("retired runtime terminology remains")
+          PY
+
+      - name: Remove temporary project resources
+        if: always()
+        run: docker compose down -v --remove-orphans

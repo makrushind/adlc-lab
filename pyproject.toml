@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adlc-lab"
+version = "0.1.0"
+description = "Compose-only laboratory for observing and attacking RAG, MCP and LLM boundaries"
+requires-python = ">=3.13"
+
+[project.scripts]
+adlc-lab = "aiweekend_target.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

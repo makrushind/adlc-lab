@@ -1,0 +1,146 @@
+name: adlc-lab
+
+services:
+  reset:
+    profiles: [tools]
+    image: adlc-lab-agent:local
+    pull_policy: never
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m"]
+    network_mode: none
+    environment:
+      LAB_SCENARIO: ${LAB_SCENARIO:-baseline}
+    volumes:
+      - workspace:/target/workspace
+      - corpus:/target/corpus
+      - rag_index:/target/rag-index
+    entrypoint: [python, -m, aiweekend_target]
+    command: [reset]
+    restart: "no"
+
+  repo-rag:
+    image: adlc-lab-repo-rag:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: repo-rag
+    pull_policy: never
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m"]
+    networks: [internal]
+    volumes:
+      - corpus:/target/corpus:ro
+      - rag_index:/target/rag-index:ro
+    entrypoint: [python, -m, aiweekend_target]
+    command: [repo-rag]
+    healthcheck:
+      test: [CMD, python, -m, aiweekend_target, health, repo-rag]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: "no"
+
+  hf-gateway:
+    image: adlc-lab-hf-gateway:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: hf-gateway
+    pull_policy: never
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m"]
+    networks: [internal, egress]
+    secrets: [hf_token]
+    entrypoint: [python, -m, aiweekend_target]
+    command: [hf-gateway]
+    healthcheck:
+      test: [CMD, python, -m, aiweekend_target, health, hf-gateway]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: "no"
+
+  agent:
+    image: adlc-lab-agent:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: agent-runtime
+    pull_policy: never
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m"]
+    networks: [internal]
+    environment:
+      ADLC_MCP_URL: http://repo-rag:8000/mcp
+      ADLC_LLM_URL: http://hf-gateway:8080/v1/chat/completions
+    volumes:
+      - workspace:/target/workspace:ro
+      - corpus:/target/corpus:ro
+      - rag_index:/target/rag-index:ro
+    entrypoint: [python, -m, aiweekend_target]
+    command: [agent]
+    depends_on:
+      repo-rag:
+        condition: service_healthy
+      hf-gateway:
+        condition: service_healthy
+    restart: "no"
+
+  setup-token:
+    profiles: [tools]
+    image: adlc-lab-agent:local
+    pull_policy: never
+    user: "0:0"
+    init: true
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=16m"]
+    network_mode: none
+    volumes:
+      - type: bind
+        source: ./.lab
+        target: /host-lab
+        bind:
+          create_host_path: true
+    entrypoint: [python, -m, aiweekend_target, setup-token]
+    command: []
+    stdin_open: true
+    tty: true
+    restart: "no"
+
+networks:
+  internal:
+    internal: true
+  egress: {}
+
+volumes:
+  workspace: {}
+  corpus: {}
+  rag_index: {}
+
+secrets:
+  hf_token:
+    file: ./.lab/secrets/hf_token

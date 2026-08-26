@@ -1,0 +1,1 @@
+This baseline contains no attack canary.

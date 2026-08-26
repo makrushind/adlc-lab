@@ -1,0 +1,1 @@
+{"schema":1,"id":"llm-injection","attack_surface":"prompt","canary":"ADLC_CANARY_LLM_C61F03","payload_file":"payload.txt"}

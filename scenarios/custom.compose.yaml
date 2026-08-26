@@ -1,0 +1,11 @@
+services:
+  reset:
+    environment:
+      LAB_SCENARIO: custom
+    volumes:
+      - type: bind
+        source: ./scenarios/custom/payload.txt
+        target: /opt/adlc/scenarios/custom/payload.txt
+        read_only: true
+        bind:
+          create_host_path: false
