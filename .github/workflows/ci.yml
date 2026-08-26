@@ -27,7 +27,7 @@ jobs:
         run: docker compose build
 
       - name: Run public tests in the agent image
-        run: docker compose run --rm --no-deps -T --entrypoint python -v "$PWD/tests:/tests:ro" agent -m unittest discover -s /tests -v
+        run: docker compose run --rm --no-deps -T --entrypoint python -v "$PWD/tests:/opt/adlc/tests:ro" agent -m unittest discover -s /opt/adlc/tests -v
 
       - name: Validate all fixed scenario fixtures
         run: docker compose run --rm --no-deps -T reset validate-scenarios
