@@ -24,7 +24,7 @@ jobs:
           done
 
       - name: Build the three native images once
-        run: docker compose build agent repo-rag hf-gateway
+        run: docker compose build --build-arg TARGETPLATFORM=linux/amd64 agent repo-rag hf-gateway
 
       - name: Validate all fixed scenario fixtures
         run: docker compose run --rm --no-deps -T reset validate-scenarios
