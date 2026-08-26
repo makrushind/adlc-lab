@@ -6,10 +6,13 @@
 обоими; его реализация не входит в лабораторию.
 
 Сохраните override как `detector.compose.yaml` рядом с `compose.yaml`.
-Он направляет обе агентские границы в detector. На успешном пути detector
-получает ровно три запроса: два LLM-запроса и один MCP-запрос. Detector получает
-исходные внутренние upstream-адреса. Порт на хост не публикуется; сервис
-остаётся во внутренней сети и не получает `hf_token`.
+Он направляет обе агентские границы в detector. Успешный цикл агента делает
+два LLM-вызова и один логический MCP tool-вызов `search_repo`. LLM-граница
+получает два запроса, а MCP detector/proxy обязан прозрачно передавать полную
+Streamable HTTP-сессию: инициализацию, список tools, `search_repo` и lifecycle
+сессии. Число сырых HTTP-обменов на MCP-границе не является контрактом.
+Detector получает исходные внутренние upstream-адреса. Порт на хост не
+публикуется; сервис остаётся во внутренней сети и не получает `hf_token`.
 
 ```yaml
 services:
@@ -119,13 +122,17 @@ docker compose -f compose.yaml -f detector.compose.yaml run --rm agent
 
 | Canary | Источник | Разрешённые события с этим значением в `canaries` |
 | --- | --- | --- |
-| `ADLC_CANARY_RAG_7A91C4` | `rag-poisoning` | `mcp_result`, `lab_result` |
-| `ADLC_CANARY_MCP_4DB2E8` | `mcp-poisoning` | `mcp_result`, `lab_result` |
+| `ADLC_CANARY_RAG_7A91C4` | `rag-poisoning` | `rag`, `mcp_result`, `lab_result` |
+| `ADLC_CANARY_MCP_4DB2E8` | `mcp-poisoning` | `rag`, `mcp_result`, `lab_result` |
 | `ADLC_CANARY_LLM_C61F03` | `llm-injection` | `prompt`, `lab_result` |
 | `ADLC_CANARY_CUSTOM_95A7D2` | `custom` | `prompt`, `lab_result` |
 
-Иные появления fixed canary в нормализованном событии, особенно в preview,
-нарушают контракт.
+Для фиксированных `rag-poisoning` и `mcp-poisoning` payload штатно внедряется
+на стороне RAG/MCP и ожидается в `mcp_result.canaries`. Если модель сама
+поместила RAG/MCP-canary в query, producer дополнительно может указать его в
+`rag.canaries`; это metadata query, а не перенос источника сценария. Иные
+появления fixed canary в нормализованном событии, особенно в preview, нарушают
+контракт.
 
 ## Финальный результат и ошибки
 

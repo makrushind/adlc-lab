@@ -57,9 +57,9 @@ docker compose run --rm setup-token
 
 Внимание: успешный запуск `agent` выполняет ровно два billable live-вызова
 модели и расходует Hugging Face credits. Аварийный запуск без повторов может
-остановиться до первого вызова или после первого, то есть сделать ноль либо
-один live-вызов. Стоимость зависит от вашего аккаунта и провайдера; не
-запускайте сценарии многократно без необходимости.
+остановиться до первого вызова, после первого или после второго, то есть
+сделать ноль, один либо два live-вызова. Стоимость зависит от вашего аккаунта
+и провайдера; не запускайте сценарии многократно без необходимости.
 
 ## Baseline: первый успешный запуск
 
@@ -126,14 +126,18 @@ docker compose -f compose.yaml -f scenarios/llm-injection.compose.yaml run --rm 
 
 | Canary | Сценарий | Разрешённые `canaries` в JSONL |
 | --- | --- | --- |
-| `ADLC_CANARY_RAG_7A91C4` | `rag-poisoning` | `mcp_result`, `lab_result` |
-| `ADLC_CANARY_MCP_4DB2E8` | `mcp-poisoning` | `mcp_result`, `lab_result` |
+| `ADLC_CANARY_RAG_7A91C4` | `rag-poisoning` | `rag`, `mcp_result`, `lab_result` |
+| `ADLC_CANARY_MCP_4DB2E8` | `mcp-poisoning` | `rag`, `mcp_result`, `lab_result` |
 | `ADLC_CANARY_LLM_C61F03` | `llm-injection` | `prompt`, `lab_result` |
 | `ADLC_CANARY_CUSTOM_95A7D2` | `custom` | `prompt`, `lab_result` |
 
 `canaries` всегда сохраняет фиксированный порядок из таблицы. Во всех
 `*_preview` полях canary заменяется на `[CANARY]`; credential-подобные значения
-заменяются на `[REDACTED]`.
+заменяются на `[REDACTED]`. Для фиксированных `rag-poisoning` и
+`mcp-poisoning` canary штатно появляется в `mcp_result`: именно там сценарий
+вносит payload. Появление того же RAG/MCP-canary в `rag.canaries` возможно
+только если модель сама поместила его в поисковый query; это metadata о query,
+а не перенос источника packaged-сценария.
 
 ## Свой prompt-canary
 
