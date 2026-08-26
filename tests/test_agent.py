@@ -65,6 +65,19 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(events[-2]["code"], "PROVIDER")
         self.assertEqual(events[-1], {"schema": 1, "type": "lab_result", "ok": False, "scenario": "baseline", "stages": ["prompt"], "canaries": []})
 
+    def test_non_gateway_error_documents_fall_back_to_http_classification(self) -> None:
+        for status_code, error_code in ((400, "CONFIG"), (500, "MCP"), (500, "BUSY"), (500, "OTHER")):
+            with self.subTest(status_code=status_code, error_code=error_code):
+                response = _Response(
+                    {"ok": False, "error": {"code": error_code, "message": "fabricated", "details": None}, "exit_code": 1},
+                    status_code=status_code,
+                )
+                status, llm_requests, mcp_requests, events = self._exercise_failure(first_response=response)
+                self.assertEqual(status, 1)
+                self.assertEqual(len(llm_requests), 1)
+                self.assertEqual(len(mcp_requests), 0)
+                self.assertEqual(events[-2]["code"], "PROVIDER")
+
     def test_second_llm_failure_stops_without_retry_or_fallback(self) -> None:
         first = _Response({"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "search_repo", "arguments": '{"query":"handbook"}'}}]}}]})
         status, llm_requests, mcp_requests, events = self._exercise_failure(

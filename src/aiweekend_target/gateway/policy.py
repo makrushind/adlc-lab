@@ -7,12 +7,14 @@ from pathlib import Path
 from typing import Any
 
 from aiweekend_target.errors import ErrorCode, TargetError
-from aiweekend_target.lab.config import BASE_MODEL, MODEL_PAIR, PROVIDER
+from aiweekend_target.lab.config import MODEL_PAIR
 
 
 ROUTING_INJECTION_FIELDS = frozenset(
     {"url", "base_url", "headers", "extra_headers", "api_key", "provider", "providers", "fallback", "fallbacks"}
 )
+
+
 def read_secret(secret_path: str | Path) -> str:
     """Read only the mounted Compose secret, without falling back to the environment."""
     try:
@@ -22,13 +24,6 @@ def read_secret(secret_path: str | Path) -> str:
     if not secret:
         raise TargetError(ErrorCode.AUTH, "Hugging Face credential is unavailable")
     return secret
-
-
-def split_model_pair(model: str) -> tuple[str, str]:
-    """Return the only fixed model/provider pair accepted by this lab."""
-    if model != MODEL_PAIR:
-        raise TargetError(ErrorCode.POLICY, "model must be the fixed exact model:provider pair")
-    return BASE_MODEL, PROVIDER
 
 
 def validate_chat_body(body: Any, selected_model: str) -> Mapping[str, Any]:

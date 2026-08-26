@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from collections.abc import Callable, Mapping
 import json
 import sys
+from collections.abc import Callable, Mapping
+from pathlib import Path
 
 import httpx
 from starlette.applications import Starlette
@@ -13,7 +13,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from aiweekend_target.errors import TargetError, local_response_status
+from aiweekend_target.errors import ErrorCode, TargetError, local_response_status
 from aiweekend_target.lab.config import MODEL_PAIR, PROVIDER
 
 from .policy import read_secret, validate_chat_body

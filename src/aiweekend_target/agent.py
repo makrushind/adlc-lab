@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
 import sys
-from typing import Any, Awaitable, Callable, IO
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Awaitable, Callable, IO
 from urllib.parse import urlsplit
 
 import httpx
@@ -25,7 +25,7 @@ from aiweekend_target.agent_protocol import (
     strict_json,
     validate_search_response,
 )
-from aiweekend_target.errors import ErrorCode, classify_upstream_status, local_response_status
+from aiweekend_target.errors import ErrorCode, classify_upstream_status, match_gateway_error
 from aiweekend_target.lab.config import GATEWAY_BASE_URL, MCP_URL, MODEL_PAIR
 from aiweekend_target.lab.trace import CANARIES, TraceObserver, canaries_in, safe_preview
 from aiweekend_target.repo_rag.types import SearchResponse
@@ -68,7 +68,6 @@ LLM_TIMEOUT = httpx.Timeout(connect=10.0, read=200.0, write=10.0, pool=10.0)
 @dataclass(frozen=True)
 class AgentPaths:
     task: Path = Path("/target/workspace/task.md")
-    workspace: Path = Path("/target/workspace")
     scenario_marker: Path = Path("/target/rag-index/scenario.json")
 
 
@@ -131,24 +130,8 @@ def _gateway_code(response: object) -> str | None:
         value = strict_json(text)
     except (UnicodeError, ValueError):
         return None
-    if not isinstance(value, dict) or set(value) != {"ok", "error", "exit_code"}:
-        return None
-    error = value.get("error")
-    if (
-        value.get("ok") is not False
-        or value.get("exit_code") != 1
-        or not isinstance(error, dict)
-        or set(error) != {"code", "message", "details"}
-        or not isinstance(error.get("code"), str)
-        or not isinstance(error.get("message"), str)
-        or (error.get("details") is not None and not isinstance(error.get("details"), dict))
-    ):
-        return None
-    try:
-        code = ErrorCode(error["code"])
-    except ValueError:
-        return None
-    return code.value if local_response_status(code) == status else None
+    code = match_gateway_error(value, status)
+    return code.value if code is not None else None
 
 
 def _response_document(response: object, stage: str) -> dict[str, object]:
@@ -290,7 +273,7 @@ async def _run(
         return 1
 
 
-def run_agent(*, paths: AgentPaths = AgentPaths(), output: IO[str] = sys.stdout, **_: Any) -> int:
+def run_agent(*, paths: AgentPaths = AgentPaths(), output: IO[str] = sys.stdout) -> int:
     """Run exactly one provider/tool/provider sequence with no retry or fallback."""
     return asyncio.run(_run(paths, output))
 

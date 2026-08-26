@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
-import json
 from typing import Any
 
 import httpx
 
 from aiweekend_target.errors import ErrorCode, TargetError, classify_upstream_status
 from aiweekend_target.lab.config import BASE_MODEL, PROVIDER, ROUTER_URL
-
-from .policy import split_model_pair
-
 
 CHAT_URL = f"{ROUTER_URL}/chat/completions"
 PROBE_TIMEOUT = httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)
