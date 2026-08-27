@@ -62,6 +62,72 @@ class PrepareReviewTests(unittest.TestCase):
                 parse_unified_diff(malformed)
             self.assertEqual(raised.exception.code, ErrorCode.POLICY)
 
+    def test_parses_git_headers_for_paths_with_spaces(self) -> None:
+        quoted = (
+            'diff --git "a/space name.py" "b/space name.py"\n'
+            '--- "a/space name.py"\n'
+            '+++ "b/space name.py"\n'
+            '@@ -1 +1 @@\n-old\n+new\n'
+        )
+        unquoted = (
+            "diff --git a/space name.py b/space name.py\n"
+            "--- a/space name.py\n"
+            "+++ b/space name.py\n"
+            "@@ -1 +1 @@\n-old\n+new\n"
+        )
+        renamed_to_spaced = (
+            'diff --git a/old.py "b/new name.py"\n'
+            'similarity index 100%\n'
+            'rename from old.py\n'
+            'rename to "new name.py"\n'
+        )
+        octal_quoted = (
+            'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n'
+            '--- "a/caf\\303\\251.py"\n'
+            '+++ "b/caf\\303\\251.py"\n'
+            '@@ -1 +1 @@\n-old\n+new\n'
+        )
+        for document in (quoted, unquoted, renamed_to_spaced, octal_quoted):
+            with self.subTest(document=document[:16]):
+                expected = "new name.py" if document == renamed_to_spaced else "café.py" if document == octal_quoted else "space name.py"
+                self.assertEqual(parse_unified_diff(document)[0].path, expected)
+
+    def test_rejects_changed_target_below_a_skipped_symlink_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            outside = root / "outside"
+            source.mkdir()
+            outside.mkdir()
+            self._write(outside, "file.py", "outside\n")
+            (source / "node_modules").symlink_to(outside, target_is_directory=True)
+            diff = root / "pr.diff"
+            diff.write_text(self._diff("node_modules/file.py", "node_modules/file.py"), encoding="utf-8")
+            marker = root / "marker.json"
+            marker.write_text("{}", encoding="utf-8")
+            with self.assertRaises(TargetError) as raised:
+                prepare_review(LabPaths(root / "workspace", root / "corpus", root / "rag-index"), source, diff, marker)
+            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+
+    def test_rejects_added_and_deleted_hunks_with_opposite_side_content(self) -> None:
+        contradictory_deleted = (
+            "diff --git a/removed.py b/removed.py\n"
+            "--- a/removed.py\n"
+            "+++ /dev/null\n"
+            "@@ -1 +1 @@\n-old\n+impossible\n"
+        )
+        contradictory_added = (
+            "diff --git a/new.py b/new.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/new.py\n"
+            "@@ -1 +1 @@\n-old\n+new\n"
+        )
+        for document in (contradictory_deleted, contradictory_added):
+            with self.subTest(document=document[:24]), self.assertRaises(TargetError) as raised:
+                parse_unified_diff(document)
+            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+
     def test_prepares_only_allowlisted_files_and_leaves_source_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

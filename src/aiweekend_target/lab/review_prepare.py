@@ -129,11 +129,11 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
         if line.startswith("rename from "):
             if rename_from is not None:
                 raise _policy("diff has malformed rename headers")
-            rename_from = _safe_path(line.removeprefix("rename from "))
+            rename_from = _safe_path(_extended_path(line.removeprefix("rename from ")))
         elif line.startswith("rename to "):
             if rename_to is not None:
                 raise _policy("diff has malformed rename headers")
-            rename_to = _safe_path(line.removeprefix("rename to "))
+            rename_to = _safe_path(_extended_path(line.removeprefix("rename to ")))
         elif line.startswith("--- "):
             if old_header is not None or position + 1 >= len(record) or not record[position + 1].startswith("+++ "):
                 raise _policy("diff has malformed file headers")
@@ -178,7 +178,11 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
         line = record[position]
         if not line.startswith("@@ "):
             raise _policy("diff has malformed hunk header")
-        old_count, new_start, new_count = _hunk_header(line)
+        old_start, old_count, new_start, new_count = _hunk_header(line)
+        if old_header is None and (old_start != 0 or old_count != 0):
+            raise _policy("added file has malformed hunk range")
+        if deleted and (new_start != 0 or new_count != 0):
+            raise _policy("deleted file has malformed hunk range")
         position += 1
         old_seen = 0
         new_seen = 0
@@ -215,17 +219,35 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
 
 
 def _git_paths(line: str) -> tuple[str, str]:
-    fields = line.split(" ")
-    if len(fields) != 4 or fields[:2] != ["diff", "--git"]:
+    prefix = "diff --git "
+    if not line.startswith(prefix):
         raise _policy("diff has malformed file header")
-    old, new = fields[2:]
+    fields = line.removeprefix(prefix)
+    if fields.startswith('"'):
+        old, remainder = _quoted_path(fields)
+        if not remainder.startswith(" "):
+            raise _policy("diff has malformed file header")
+        new, remainder = _path_token(remainder[1:])
+        if remainder:
+            raise _policy("diff has malformed file header")
+    else:
+        separators = [position for position in (fields.find(" b/"), fields.find(' "b/')) if position > 0]
+        if not separators:
+            raise _policy("diff has malformed file header")
+        separator = min(separators)
+        old = fields[:separator]
+        new, remainder = _path_token(fields[separator + 1 :])
+        if remainder:
+            raise _policy("diff has malformed file header")
     if not old.startswith("a/") or not new.startswith("b/"):
         raise _policy("diff has malformed file header")
     return _safe_path(old[2:]), _safe_path(new[2:])
 
 
 def _header_path(value: str, prefix: str) -> str | None:
-    path = value.split("\t", 1)[0]
+    path, remainder = _path_token(value)
+    if remainder and not remainder.startswith("\t"):
+        raise _policy("diff has malformed file headers")
     if path == "/dev/null":
         return None
     if not path.startswith(prefix + "/"):
@@ -234,7 +256,7 @@ def _header_path(value: str, prefix: str) -> str | None:
 
 
 def _safe_path(value: str) -> str:
-    if not value or "\x00" in value or "\\" in value:
+    if not value or "\x00" in value or "\\" in value or any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise _policy("diff path is unsafe")
     path = PurePosixPath(value)
     if path.is_absolute() or ".." in path.parts or "." in path.parts:
@@ -242,7 +264,7 @@ def _safe_path(value: str) -> str:
     return path.as_posix()
 
 
-def _hunk_header(line: str) -> tuple[int, int, int]:
+def _hunk_header(line: str) -> tuple[int, int, int, int]:
     match = _HUNK.fullmatch(line)
     if match is None:
         raise _policy("diff has malformed hunk header")
@@ -252,7 +274,52 @@ def _hunk_header(line: str) -> tuple[int, int, int]:
     new_count = int(match["new_count"] or "1")
     if (old_count and old_start < 1) or (new_count and new_start < 1):
         raise _policy("diff has malformed hunk header")
-    return old_count, new_start, new_count
+    return old_start, old_count, new_start, new_count
+
+
+def _path_token(value: str) -> tuple[str, str]:
+    if value.startswith('"'):
+        return _quoted_path(value)
+    path, separator, remainder = value.partition("\t")
+    return path, separator + remainder
+
+
+def _extended_path(value: str) -> str:
+    path, remainder = _path_token(value)
+    if remainder:
+        raise _policy("diff has malformed rename headers")
+    return path
+
+
+def _quoted_path(value: str) -> tuple[str, str]:
+    encoded = bytearray()
+    position = 1
+    escapes = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11, '"': 34, "\\": 92}
+    while position < len(value):
+        character = value[position]
+        if character == '"':
+            try:
+                return bytes(encoded).decode("utf-8"), value[position + 1 :]
+            except UnicodeDecodeError as error:
+                raise _policy("diff has malformed quoted path") from error
+        if character != "\\":
+            encoded.extend(character.encode("utf-8"))
+            position += 1
+            continue
+        position += 1
+        if position >= len(value):
+            break
+        escaped = value[position]
+        if escaped in escapes:
+            encoded.append(escapes[escaped])
+            position += 1
+            continue
+        if escaped in "01234567" and position + 2 < len(value) and all(item in "01234567" for item in value[position : position + 3]):
+            encoded.append(int(value[position : position + 3], 8))
+            position += 3
+            continue
+        raise _policy("diff has malformed quoted path")
+    raise _policy("diff has malformed quoted path")
 
 
 def _read_diff(path: Path) -> str:
@@ -310,13 +377,23 @@ def _read_filtered_checkout(root: Path) -> dict[str, bytes]:
 
 
 def _validate_changed_targets(changes: tuple[ReviewChange, ...], root: Path) -> None:
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError as error:
+        raise _policy("source checkout is unavailable") from error
     for change in changes:
         if change.deleted:
             continue
         target = root.joinpath(*PurePosixPath(change.path).parts)
         try:
+            ancestor = root
+            for part in PurePosixPath(change.path).parts:
+                ancestor = ancestor / part
+                if stat.S_ISLNK(ancestor.lstat().st_mode):
+                    raise _policy("changed target has a symlink ancestor")
             target_stat = target.lstat()
-        except OSError as error:
+            target.resolve(strict=True).relative_to(resolved_root)
+        except (OSError, ValueError) as error:
             raise _policy("changed target is unavailable") from error
         if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
             raise _policy("changed target is not a regular file")
