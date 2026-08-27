@@ -1247,6 +1247,18 @@ class PullRequestReviewLoopTests(unittest.TestCase):
             with self.subTest(status=status):
                 self.assertIn(f'"status":"{status}","path":"{path}"', prompt)
 
+    def test_large_digest_accepts_deleted_content_that_looks_like_a_file_header(self) -> None:
+        document = (
+            "diff --git a/modified.md b/modified.md\n"
+            "--- a/modified.md\n"
+            "+++ b/modified.md\n"
+            "@@ -1 +1 @@\n"
+            "--- ordinary-deleted-content\n"
+            "+replacement\n"
+            + self._added_lines_diff("padding.md", ["x"] * 12_000)
+        )
+        self.assertIn('"status":"modified","path":"modified.md"', self._prompt(document))
+
     def test_large_digest_escapes_closing_review_boundary_in_untrusted_data(self) -> None:
         closing = "</REVIEW_DIFF>"
         document = self._added_lines_diff("closing.md", [closing] * 12_000)

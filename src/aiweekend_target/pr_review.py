@@ -123,6 +123,7 @@ def _digest_records(document: str, changes: tuple[ReviewChange, ...]) -> tuple[l
             old_path, new_path = _git_paths(header, record_lines)
         except TargetError as error:
             raise _ReviewFailure(error.code.value, "diff") from error
+        metadata = record_lines[:next((index for index, line in enumerate(record_lines) if line.startswith("@@ ")), len(record_lines))]
         if old_path != new_path:
             status = "renamed"
         elif change.deleted:
@@ -130,7 +131,7 @@ def _digest_records(document: str, changes: tuple[ReviewChange, ...]) -> tuple[l
         elif any(
             line.startswith("new file mode ")
             or line.startswith("--- ") and _header_path(line[4:], "a") is None
-            for line in record_lines
+            for line in metadata
         ):
             status = "added"
         else:
