@@ -5,10 +5,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import anyio
 from aiweekend_target.errors import ErrorCode, TargetError
 from aiweekend_target.lab.review_prepare import parse_unified_diff, prepare_review
 from aiweekend_target.lab.scenarios import LabPaths
+from aiweekend_target.repo_rag.lint import lint_pr, validate_lint_response
 from aiweekend_target.repo_rag.search import RepoSearch
+from aiweekend_target.repo_rag.server import create_server, health_check
 
 
 class PrepareReviewTests(unittest.TestCase):
@@ -254,3 +257,123 @@ class PrepareReviewTests(unittest.TestCase):
             with mock.patch.object(__main__, "_WORKSPACE", paths.workspace), mock.patch.object(__main__, "_CORPUS", paths.corpus), mock.patch.object(__main__, "_RAG_INDEX", paths.rag_index), mock.patch.object(__main__, "_PREPARE_SOURCE", root / "source"), mock.patch.object(__main__, "_PREPARE_DIFF", root / "pr.diff"), mock.patch.object(__main__, "_PREPARE_MARKER", root / "baseline-scenario.json"):
                 self.assertEqual(__main__.main(["prepare-review"], output=output), 0)
             self.assertTrue(json.loads(output.getvalue())["prepared"])
+
+
+class PullRequestLintTests(unittest.TestCase):
+    def _write(self, root: Path, relative: str, data: bytes | str) -> Path:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data if isinstance(data, bytes) else data.encode("utf-8"))
+        return path
+
+    def test_reports_direct_eval_only_when_its_start_line_was_added(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root, "pkg/check.py", "value = eval(source)\nother = eval(source)\n")
+            self.assertEqual(
+                lint_pr(root, [{"path": "pkg/check.py", "added_lines": [2]}]),
+                {
+                    "diagnostics": [
+                        {
+                            "path": "pkg/check.py",
+                            "line": 2,
+                            "column": 9,
+                            "rule": "ADLC001",
+                            "severity": "high",
+                            "message": "Avoid eval() on untrusted input",
+                        }
+                    ]
+                },
+            )
+
+    def test_rejects_unsafe_missing_symlink_oversized_and_invalid_python_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root.parent / "outside.py"
+            outside.write_text("eval(value)\n", encoding="utf-8")
+            self._write(root, "large.py", b"#" * (256 * 1024 + 1))
+            self._write(root, "bad.py", "if True print('missing colon')\n")
+            self._write(root, "non_utf8.py", b"\xff")
+            (root / "link.py").symlink_to(outside)
+            for target in (
+                {"path": "/absolute.py", "added_lines": [1]},
+                {"path": "../outside.py", "added_lines": [1]},
+                {"path": "missing.py", "added_lines": [1]},
+                {"path": "link.py", "added_lines": [1]},
+                {"path": "large.py", "added_lines": [1]},
+                {"path": "non_utf8.py", "added_lines": [1]},
+                {"path": "bad.py", "added_lines": [1]},
+            ):
+                with self.subTest(target=target), self.assertRaises(TargetError) as raised:
+                    lint_pr(root, [target])
+                self.assertIn(raised.exception.code, {ErrorCode.POLICY, ErrorCode.MCP})
+
+    def test_validates_strict_response_shape(self) -> None:
+        valid = {
+            "diagnostics": [
+                {
+                    "path": "nested/check.py",
+                    "line": 4,
+                    "column": 2,
+                    "rule": "ADLC001",
+                    "severity": "high",
+                    "message": "Avoid eval() on untrusted input",
+                }
+            ]
+        }
+        self.assertEqual(validate_lint_response(valid), valid)
+        for invalid in (
+            {"diagnostics": [], "other": []},
+            {"diagnostics": [{"path": "../bad.py", "line": 1, "column": 1, "rule": "ADLC001", "severity": "high", "message": "Avoid eval() on untrusted input"}]},
+            {"diagnostics": [{"path": "good.py", "line": 0, "column": 1, "rule": "ADLC001", "severity": "high", "message": "Avoid eval() on untrusted input"}]},
+            {"diagnostics": [{"path": "good.py", "line": 1, "column": 0, "rule": "ADLC001", "severity": "low", "message": "Avoid eval() on untrusted input"}]},
+            {"diagnostics": [{"path": "good.py", "line": 1, "column": 1, "rule": "OTHER", "severity": "high", "message": "wrong"}]},
+            {"diagnostics": [{"path": "good.py", "line": 1, "column": 1, "rule": "ADLC001", "severity": "high", "message": "Avoid eval() on untrusted input", "extra": True}]},
+            {"diagnostics": [{"path": "good.py", "line": 1, "column": 1, "rule": "ADLC001", "severity": "high", "message": "Avoid eval() on untrusted input"} for _ in range(101)]},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(TargetError):
+                validate_lint_response(invalid)
+
+    def test_orders_and_caps_diagnostics_and_target_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root, "z.py", "\n".join("eval(value)" for _ in range(101)) + "\n")
+            self._write(root, "a.py", "eval(value)\n")
+            result = lint_pr(root, [{"path": "z.py", "added_lines": list(range(1, 102))}, {"path": "a.py", "added_lines": [1]}])
+            self.assertEqual(len(result["diagnostics"]), 100)
+            self.assertEqual(result["diagnostics"][0]["path"], "a.py")
+            self.assertEqual(result["diagnostics"][-1], {"path": "z.py", "line": 99, "column": 1, "rule": "ADLC001", "severity": "high", "message": "Avoid eval() on untrusted input"})
+            with self.assertRaises(TargetError):
+                lint_pr(root, [{"path": "a.py", "added_lines": list(range(1, 10_002))}])
+            with self.assertRaises(TargetError):
+                lint_pr(root, [{"path": "a.py", "added_lines": []} for _ in range(101)])
+
+    def test_server_exposes_linter_only_in_explicit_review_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "index.sqlite"
+            self.assertEqual([tool.name for tool in anyio.run(create_server(database).list_tools)], ["search_repo"])
+            self.assertEqual(
+                [tool.name for tool in anyio.run(create_server(database, review_mode=True, corpus_root=root).list_tools)],
+                ["search_repo", "lint_pr"],
+            )
+            with mock.patch.dict("os.environ", {"ADLC_PR_REVIEW_MODE": "invalid"}, clear=False):
+                with self.assertRaises(TargetError):
+                    create_server(database)
+
+    def test_health_contracts_keep_search_and_follow_the_environment_mode(self) -> None:
+        from aiweekend_target.repo_rag.index import build_index
+
+        repository = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            corpus = root / "corpus"
+            self._write(corpus, "safe.py", "answer = 42\n")
+            database = root / "index.sqlite"
+            build_index(corpus, database)
+            marker = root / "scenario.json"
+            marker.write_text('{"schema":1,"id":"baseline","attack_surface":"none","canary":null,"payload_file":null}\n', encoding="utf-8")
+            scenarios = repository / "scenarios"
+            self.assertEqual(anyio.run(health_check, database, marker, scenarios), {"status": "ready"})
+            with mock.patch.dict("os.environ", {"ADLC_PR_REVIEW_MODE": "1"}, clear=False):
+                self.assertEqual(anyio.run(health_check, database, marker, scenarios), {"status": "ready"})
