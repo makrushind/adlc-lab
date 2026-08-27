@@ -16,7 +16,9 @@ from aiweekend_target.agent import run_agent
 from aiweekend_target.errors import ErrorCode, TargetError, match_gateway_error
 from aiweekend_target.gateway import create_app
 from aiweekend_target.lab.scenarios import LabPaths, load_scenario, reset_scenario, validate_scenarios
+from aiweekend_target.lab.review_prepare import prepare_review
 from aiweekend_target.lab.token import manage_hf_token
+from aiweekend_target.pr_review import run_pr_review
 from aiweekend_target.repo_rag.server import health_http, serve
 
 
@@ -29,6 +31,9 @@ _SCENARIOS_ROOT = Path("/opt/adlc/scenarios")
 _SCENARIO_REPOSITORY = _SCENARIOS_ROOT.parent
 _SECRET = Path("/run/secrets/hf_token")
 _GATEWAY_READY = "http://127.0.0.1:8080/health/ready"
+_PREPARE_SOURCE = Path("/input/repo")
+_PREPARE_DIFF = Path("/input/pr.diff")
+_PREPARE_MARKER = Path("/opt/adlc/scenarios/baseline/scenario.json")
 
 
 def _write(output: IO[str], value: dict[str, object]) -> None:
@@ -45,6 +50,10 @@ def _reset() -> dict[str, object]:
 
 def _agent() -> int:
     return run_agent()
+
+
+def _pr_review(output: IO[str]) -> int:
+    return run_pr_review(output=output)
 
 
 def _repo_rag() -> None:
@@ -90,6 +99,15 @@ def _validate() -> dict[str, object]:
     return {"ok": True, "scenarios": [scenario.id for scenario in scenarios]}
 
 
+def _prepare_review() -> dict[str, object]:
+    return prepare_review(
+        LabPaths(_WORKSPACE, _CORPUS, _RAG_INDEX),
+        _PREPARE_SOURCE,
+        _PREPARE_DIFF,
+        _PREPARE_MARKER,
+    )
+
+
 def main(argv: list[str] | None = None, *, output: IO[str] = sys.stdout) -> int:
     """Dispatch only the fixed lab command forms."""
     arguments = list(sys.argv[1:] if argv is None else argv)
@@ -97,8 +115,13 @@ def main(argv: list[str] | None = None, *, output: IO[str] = sys.stdout) -> int:
         if arguments == ["reset"]:
             _write(output, _reset())
             return 0
+        if arguments == ["prepare-review"]:
+            _write(output, _prepare_review())
+            return 0
         if arguments == ["agent"]:
             return _agent()
+        if arguments == ["pr-review"]:
+            return _pr_review(output)
         if arguments == ["repo-rag"]:
             _repo_rag()
             return 0

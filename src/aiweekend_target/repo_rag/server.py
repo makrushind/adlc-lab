@@ -18,13 +18,16 @@ from starlette.applications import Starlette
 from aiweekend_target.errors import ErrorCode, TargetError
 from aiweekend_target.lab.scenarios import load_scenario
 from aiweekend_target.lab.trace import CANARIES, safe_preview
+from aiweekend_target.repo_rag.lint import LintResponse, lint_pr, validate_lint_response
 from aiweekend_target.repo_rag.search import DATABASE_ENV, RepoSearch
 from aiweekend_target.repo_rag.types import SearchResponse, SearchResult
 
 
 DEFAULT_MARKER_PATH = Path("/target/rag-index/scenario.json")
 DEFAULT_SCENARIOS_ROOT = Path("/opt/adlc/scenarios")
+DEFAULT_CORPUS_ROOT = Path("/target/corpus")
 DEFAULT_LOOPBACK_URL = "http://127.0.0.1:8000/mcp"
+REVIEW_MODE_ENV = "ADLC_PR_REVIEW_MODE"
 
 
 class HealthSession(Protocol):
@@ -37,6 +40,15 @@ class HealthSession(Protocol):
 
 def _mcp_error(message: str) -> TargetError:
     return TargetError(ErrorCode.MCP, message)
+
+
+def _review_mode(explicit: bool | None = None) -> bool:
+    value = os.environ.get(REVIEW_MODE_ENV)
+    if value is not None and value not in {"0", "1"}:
+        raise TargetError(ErrorCode.CONFIG, "pull-request review mode is invalid")
+    if explicit is not None and type(explicit) is not bool:
+        raise TargetError(ErrorCode.CONFIG, "pull-request review mode is invalid")
+    return explicit is True or value == "1"
 
 
 def _default_trace(document: dict[str, object]) -> None:
@@ -134,8 +146,10 @@ def create_server(
     scenarios_root: str | Path = DEFAULT_SCENARIOS_ROOT,
     *,
     trace_sink: Callable[[dict[str, object]], None] = _default_trace,
+    review_mode: bool | None = None,
+    corpus_root: str | Path = DEFAULT_CORPUS_ROOT,
 ) -> MCPServer:
-    """Create a server exposing exactly the read-only ``search_repo`` tool."""
+    """Create the safe search server, optionally with pull-request linting."""
     configured_path = os.fspath(database_path) if database_path is not None else os.environ.get(DATABASE_ENV)
     if not configured_path:
         raise _mcp_error("repository index path is not configured")
@@ -146,6 +160,12 @@ def create_server(
     def search_repo_tool(query: str, limit: int = 5, path_glob: str | None = None) -> SearchResponse:
         return repository.search_repo(query, limit, path_glob)
 
+    if _review_mode(review_mode):
+
+        @server.tool(name="lint_pr", structured_output=True)
+        def lint_pr_tool(targets: list[dict[str, object]]) -> LintResponse:
+            return validate_lint_response(lint_pr(corpus_root, targets))
+
     return server
 
 
@@ -154,7 +174,7 @@ async def health_check(
     scenario_marker_path: str | Path = DEFAULT_MARKER_PATH,
     scenarios_root: str | Path = DEFAULT_SCENARIOS_ROOT,
 ) -> dict[str, str]:
-    """Initialize the MCP surface, list one tool, call it once, and validate its shape."""
+    """Initialize the MCP surface, list its allowed tools, and call safe search once."""
     server = create_server(database_path, scenario_marker_path, scenarios_root, trace_sink=lambda _: None)
 
     class LocalSession:
@@ -185,7 +205,8 @@ async def health_session(session: HealthSession) -> dict[str, str]:
         if (
             getattr(listing, "result_type", None) != "complete"
             or getattr(listing, "next_cursor", None) is not None
-            or [tool.name for tool in getattr(listing, "tools", [])] != ["search_repo"]
+            or [tool.name for tool in getattr(listing, "tools", [])]
+            != (["search_repo", "lint_pr"] if _review_mode() else ["search_repo"])
         ):
             raise _mcp_error("repo-rag health contract failed")
         result = await session.call_tool("search_repo", {"query": "health", "limit": 1})

@@ -89,12 +89,14 @@ class TargetError(Exception):
         message: str,
         details: Any = None,
         exit_code: int = 1,
+        diagnostics: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.details = details
         self.exit_code = exit_code
+        self.diagnostics = dict(diagnostics) if diagnostics is not None else None
 
     def as_result(self) -> dict[str, Any]:
         return {

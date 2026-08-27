@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
@@ -15,6 +16,39 @@ from aiweekend_target.lab.config import BASE_MODEL, PROVIDER, ROUTER_URL
 CHAT_URL = f"{ROUTER_URL}/chat/completions"
 PROBE_TIMEOUT = httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)
 CHAT_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)
+MAX_ERROR_SAMPLE_BYTES = 16 * 1024
+MAX_CONTENT_LENGTH_DIGITS = 20
+_SAFE_ERROR_TYPES = frozenset({
+    "authentication_error",
+    "generation_error",
+    "invalid_request_error",
+    "not_found_error",
+    "permission_error",
+    "rate_limit_error",
+    "server_error",
+})
+_SAFE_ERROR_CODES = frozenset({
+    "context_length_exceeded",
+    "generation_failed",
+    "invalid_api_key",
+    "model_not_found",
+    "rate_limit_exceeded",
+    "tool_validation_failed",
+    "unsupported_value",
+})
+_SAFE_ERROR_PARAMS = frozenset({
+    "max_completion_tokens",
+    "max_tokens",
+    "messages",
+    "model",
+    "response_format",
+    "stop",
+    "stream",
+    "temperature",
+    "tool_choice",
+    "tools",
+    "top_p",
+})
 
 
 @dataclass(frozen=True)
@@ -35,12 +69,88 @@ def _headers(secret: str, accept: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {secret}", "Content-Type": "application/json", "Accept": accept}
 
 
-def _upstream_error(status_code: int) -> TargetError:
-    return TargetError(classify_upstream_status(status_code), "Hugging Face Router request failed", {"upstream_status": status_code})
+def _upstream_error(status_code: int, diagnostics: Mapping[str, object] | None = None) -> TargetError:
+    return TargetError(
+        classify_upstream_status(status_code),
+        "Hugging Face Router request failed",
+        {"upstream_status": status_code},
+        diagnostics=diagnostics,
+    )
 
 
 def _provider_error() -> TargetError:
     return TargetError(ErrorCode.PROVIDER, "Hugging Face Router is unavailable")
+
+
+def _declared_error_body_length(response: httpx.Response) -> int | None:
+    value = response.headers.get("content-length")
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > MAX_CONTENT_LENGTH_DIGITS
+        or not value.isascii()
+        or not value.isdecimal()
+    ):
+        return None
+    return int(value)
+
+
+def _safe_upstream_field(value: object, allowed: frozenset[str]) -> str | None:
+    if type(value) is str and value in allowed:
+        return value
+    return None
+
+
+def _error_diagnostics(status_code: int, sample: bytes, truncated: bool) -> dict[str, object]:
+    error_type: str | None = None
+    error_code: str | None = None
+    error_param: str | None = None
+    has_failed_generation = False
+    try:
+        payload = json.loads(sample)
+    except (UnicodeDecodeError, ValueError):
+        payload = None
+    if isinstance(payload, Mapping):
+        has_failed_generation = "failed_generation" in payload
+        error = payload.get("error")
+        if isinstance(error, Mapping):
+            error_type = _safe_upstream_field(error.get("type"), _SAFE_ERROR_TYPES)
+            error_code = _safe_upstream_field(error.get("code"), _SAFE_ERROR_CODES)
+            error_param = _safe_upstream_field(error.get("param"), _SAFE_ERROR_PARAMS)
+    return {
+        "status": status_code,
+        "error_type": error_type,
+        "error_code": error_code,
+        "error_param": error_param,
+        "has_failed_generation": has_failed_generation,
+        "sample_bytes": len(sample),
+        "sample_sha256": hashlib.sha256(sample).hexdigest(),
+        "truncated": truncated,
+    }
+
+
+async def _bounded_error_diagnostics(response: httpx.Response) -> dict[str, object]:
+    declared_length = _declared_error_body_length(response)
+    if declared_length is None or declared_length > MAX_ERROR_SAMPLE_BYTES:
+        return _error_diagnostics(response.status_code, b"", True)
+    sample = bytearray()
+    truncated = False
+    async for chunk in response.aiter_raw(chunk_size=MAX_ERROR_SAMPLE_BYTES):
+        remaining = MAX_ERROR_SAMPLE_BYTES - len(sample)
+        if len(chunk) > remaining:
+            sample.extend(chunk[:remaining])
+            truncated = True
+            break
+        sample.extend(chunk)
+        if len(sample) > MAX_ERROR_SAMPLE_BYTES:
+            del sample[MAX_ERROR_SAMPLE_BYTES:]
+            truncated = True
+            break
+        if response.num_bytes_downloaded > MAX_ERROR_SAMPLE_BYTES:
+            truncated = True
+        if len(sample) == MAX_ERROR_SAMPLE_BYTES:
+            break
+    return _error_diagnostics(response.status_code, bytes(sample), truncated)
 
 
 async def probe_available(secret: str, transport: httpx.AsyncBaseTransport | None) -> None:
@@ -54,14 +164,21 @@ async def probe_available(secret: str, transport: httpx.AsyncBaseTransport | Non
             trust_env=False,
         ) as client:
             request = httpx.Request("GET", url, headers=_headers(secret, "application/json"))
-            response = await client.send(request)
+            response = await client.send(request, stream=True)
+            if not 200 <= response.status_code < 300:
+                try:
+                    diagnostics = await _bounded_error_diagnostics(response)
+                finally:
+                    await response.aclose()
+                raise _upstream_error(response.status_code, diagnostics)
+            try:
+                await response.aread()
+                payload = response.json()
+            except (ValueError, UnicodeDecodeError) as error:
+                raise _provider_error() from error
+            finally:
+                await response.aclose()
     except httpx.HTTPError as error:
-        raise _provider_error() from error
-    if not 200 <= response.status_code < 300:
-        raise _upstream_error(response.status_code)
-    try:
-        payload = response.json()
-    except (ValueError, UnicodeDecodeError) as error:
         raise _provider_error() from error
     if not isinstance(payload, dict):
         raise _provider_error()
@@ -103,14 +220,19 @@ async def send_chat(
             headers=headers,
             content=json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         )
-        response = await client.send(request, stream=streaming)
+        response = await client.send(request, stream=True)
     except httpx.HTTPError as error:
         await client.aclose()
         raise _provider_error() from error
     if not 200 <= response.status_code < 300:
-        await response.aclose()
-        await client.aclose()
-        raise _upstream_error(response.status_code)
+        try:
+            diagnostics = await _bounded_error_diagnostics(response)
+        except httpx.HTTPError as error:
+            raise _provider_error() from error
+        finally:
+            await response.aclose()
+            await client.aclose()
+        raise _upstream_error(response.status_code, diagnostics)
     content_type = response.headers.get("content-type", "application/json" if not streaming else "text/event-stream")
     if not streaming:
         try:
