@@ -92,6 +92,22 @@ class PrepareReviewTests(unittest.TestCase):
                 expected = "new name.py" if document == renamed_to_spaced else "café.py" if document == octal_quoted else "space name.py"
                 self.assertEqual(parse_unified_diff(document)[0].path, expected)
 
+    def test_parses_unquoted_nested_paths_with_a_b_separator(self) -> None:
+        modified = (
+            "diff --git a/x b/z.py b/x b/z.py\n"
+            "--- a/x b/z.py\t\n"
+            "+++ b/x b/z.py\t\n"
+            "@@ -1 +1 @@\n-old\n+new\n"
+        )
+        renamed = (
+            "diff --git a/x b/old.py b/x b/new.py\n"
+            "similarity index 100%\n"
+            "rename from x b/old.py\n"
+            "rename to x b/new.py\n"
+        )
+        self.assertEqual(parse_unified_diff(modified)[0].path, "x b/z.py")
+        self.assertEqual(parse_unified_diff(renamed)[0].path, "x b/new.py")
+
     def test_rejects_changed_target_below_a_skipped_symlink_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

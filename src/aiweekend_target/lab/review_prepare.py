@@ -54,12 +54,13 @@ def parse_unified_diff(document: str) -> tuple[ReviewChange, ...]:
     while position < len(lines):
         if not lines[position].startswith("diff --git "):
             raise _policy("diff has a malformed file header")
-        old_from_git, new_from_git = _git_paths(lines[position])
+        header = lines[position]
         position += 1
         record: list[str] = []
         while position < len(lines) and not lines[position].startswith("diff --git "):
             record.append(lines[position])
             position += 1
+        old_from_git, new_from_git = _git_paths(header, record)
         if {old_from_git, new_from_git} & seen_record_paths:
             raise _policy("diff has duplicate contradictory file records")
         seen_record_paths.update((old_from_git, new_from_git))
@@ -218,7 +219,7 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
     return ReviewChange(target, tuple(sorted(set(added))), deleted)
 
 
-def _git_paths(line: str) -> tuple[str, str]:
+def _git_paths(line: str, record: list[str]) -> tuple[str, str]:
     prefix = "diff --git "
     if not line.startswith(prefix):
         raise _policy("diff has malformed file header")
@@ -231,17 +232,55 @@ def _git_paths(line: str) -> tuple[str, str]:
         if remainder:
             raise _policy("diff has malformed file header")
     else:
-        separators = [position for position in (fields.find(" b/"), fields.find(' "b/')) if position > 0]
-        if not separators:
+        candidates = _unquoted_header_candidates(fields)
+        declared = _declared_record_paths(record)
+        if declared:
+            candidates = [candidate for candidate in candidates if all(_matches_declared_path(candidate, pair) for pair in declared)]
+        if len(candidates) != 1:
             raise _policy("diff has malformed file header")
-        separator = min(separators)
-        old = fields[:separator]
-        new, remainder = _path_token(fields[separator + 1 :])
-        if remainder:
-            raise _policy("diff has malformed file header")
+        return candidates[0]
     if not old.startswith("a/") or not new.startswith("b/"):
         raise _policy("diff has malformed file header")
     return _safe_path(old[2:]), _safe_path(new[2:])
+
+
+def _unquoted_header_candidates(fields: str) -> list[tuple[str, str]]:
+    candidates: set[tuple[str, str]] = set()
+    for marker in (" b/", ' "b/'):
+        position = fields.find(marker)
+        while position > 0:
+            old = fields[:position]
+            try:
+                new, remainder = _path_token(fields[position + 1 :])
+                if not remainder and old.startswith("a/") and new.startswith("b/"):
+                    candidates.add((_safe_path(old[2:]), _safe_path(new[2:])))
+            except TargetError:
+                pass
+            position = fields.find(marker, position + 1)
+    return sorted(candidates)
+
+
+def _declared_record_paths(record: list[str]) -> list[tuple[str | None, str | None]]:
+    declared: list[tuple[str | None, str | None]] = []
+    rename_from: str | None = None
+    rename_to: str | None = None
+    for position, line in enumerate(record):
+        if line.startswith("@@ "):
+            break
+        if line.startswith("rename from "):
+            rename_from = _safe_path(_extended_path(line.removeprefix("rename from ")))
+        elif line.startswith("rename to "):
+            rename_to = _safe_path(_extended_path(line.removeprefix("rename to ")))
+        elif line.startswith("--- ") and position + 1 < len(record) and record[position + 1].startswith("+++ "):
+            declared.append((_header_path(line[4:], "a"), _header_path(record[position + 1][4:], "b")))
+    if rename_from is not None and rename_to is not None:
+        declared.append((rename_from, rename_to))
+    return declared
+
+
+def _matches_declared_path(candidate: tuple[str, str], declared: tuple[str | None, str | None]) -> bool:
+    old, new = declared
+    return (old is None or old == candidate[0]) and (new is None or new == candidate[1])
 
 
 def _header_path(value: str, prefix: str) -> str | None:
