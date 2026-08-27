@@ -20,6 +20,7 @@ _MAX_FILES = 1000
 _MAX_FILE_BYTES = 256 * 1024
 _MAX_TOTAL_BYTES = 10 * 1024 * 1024
 _MAX_MARKER_BYTES = 16 * 1024
+_MAX_HUNK_NUMBER = (1 << 63) - 1
 _ALLOWED_SUFFIXES = frozenset({".py", ".pyi", ".md", ".toml", ".yaml", ".yml", ".json", ".txt"})
 _SKIPPED_DIRECTORIES = frozenset({
     ".git", ".venv", "venv", "env", "node_modules", "vendor", "build", "dist", "cache", ".cache",
@@ -43,6 +44,7 @@ class ReviewChange:
     added_lines: tuple[int, ...]
     deleted: bool
     new_hunks: tuple[tuple[int, tuple[str, ...]], ...] = field(default=(), compare=False, repr=False)
+    added: bool = False
 
 
 def parse_unified_diff(document: str) -> tuple[ReviewChange, ...]:
@@ -223,13 +225,14 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
         if new_file_mode is not None:
             if old_from_git != new_from_git or not _empty_file_index(index_hashes, added=True):
                 raise _policy("diff has contradictory metadata")
-            return ReviewChange(new_from_git, (), False)
+            return ReviewChange(new_from_git, (), False, added=True)
         if deleted_file_mode is not None:
             if old_from_git != new_from_git or not _empty_file_index(index_hashes, added=False):
                 raise _policy("diff has contradictory metadata")
             return ReviewChange(old_from_git, (), True)
         raise _policy("diff has no changes")
 
+    added_file = old_header is None
     deleted = new_header is None
     if (old_header is not None and old_header != old_from_git) or (new_header is not None and new_header != new_from_git):
         raise _policy("diff paths do not match file header")
@@ -291,7 +294,13 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
     target = old_header if deleted else new_header
     if target is None:
         raise _policy("diff has malformed file headers")
-    return ReviewChange(target, tuple(sorted(set(added))), deleted, tuple(new_hunks))
+    return ReviewChange(
+        target,
+        tuple(sorted(set(added))),
+        deleted,
+        tuple(new_hunks),
+        added=added_file,
+    )
 
 
 def _record_mode(current: str | None, value: str) -> str:
@@ -301,8 +310,9 @@ def _record_mode(current: str | None, value: str) -> str:
 
 
 def _validate_percentage(value: str) -> None:
-    if not value.endswith("%") or not value[:-1].isdigit() or not 0 <= int(value[:-1]) <= 100:
+    if not value.endswith("%"):
         raise _policy("diff has malformed metadata")
+    _bounded_decimal(value[:-1], 100, "diff has malformed metadata")
 
 
 def _empty_file_index(index_hashes: tuple[str, str] | None, *, added: bool) -> bool:
@@ -401,13 +411,26 @@ def _hunk_header(line: str) -> tuple[int, int, int, int]:
     match = _HUNK.fullmatch(line)
     if match is None:
         raise _policy("diff has malformed hunk header")
-    old_start = int(match["old_start"])
-    old_count = int(match["old_count"] or "1")
-    new_start = int(match["new_start"])
-    new_count = int(match["new_count"] or "1")
+    old_start = _bounded_decimal(match["old_start"], _MAX_HUNK_NUMBER, "diff has malformed hunk header")
+    old_count = _bounded_decimal(match["old_count"] or "1", _MAX_HUNK_NUMBER, "diff has malformed hunk header")
+    new_start = _bounded_decimal(match["new_start"], _MAX_HUNK_NUMBER, "diff has malformed hunk header")
+    new_count = _bounded_decimal(match["new_count"] or "1", _MAX_HUNK_NUMBER, "diff has malformed hunk header")
     if (old_count and old_start < 1) or (new_count and new_start < 1):
         raise _policy("diff has malformed hunk header")
     return old_start, old_count, new_start, new_count
+
+
+def _bounded_decimal(value: str, maximum: int, message: str) -> int:
+    limit = str(maximum)
+    if (
+        not value
+        or not value.isascii()
+        or not value.isdigit()
+        or len(value) > len(limit)
+        or len(value) == len(limit) and value > limit
+    ):
+        raise _policy(message)
+    return int(value)
 
 
 def _path_token(value: str) -> tuple[str, str]:
@@ -448,7 +471,10 @@ def _quoted_path(value: str) -> tuple[str, str]:
             position += 1
             continue
         if escaped in "01234567" and position + 2 < len(value) and all(item in "01234567" for item in value[position : position + 3]):
-            encoded.append(int(value[position : position + 3], 8))
+            octet = int(value[position : position + 3], 8)
+            if octet > 255:
+                raise _policy("diff has malformed quoted path")
+            encoded.append(octet)
             position += 3
             continue
         raise _policy("diff has malformed quoted path")
@@ -543,11 +569,12 @@ def _validate_changed_targets(
         relative = PurePosixPath(change.path)
         if any(part in _SKIPPED_DIRECTORIES for part in relative.parts[:-1]):
             raise _policy("changed target is excluded from the review corpus")
+        target = root.joinpath(*relative.parts)
         if change.deleted:
+            _validate_deleted_target_absent(root, relative)
             continue
         if change.path.endswith(".py") and change.path not in files:
             raise _policy("changed Python target is excluded from the review corpus")
-        target = root.joinpath(*relative.parts)
         try:
             ancestor = root
             for part in relative.parts:
@@ -560,7 +587,7 @@ def _validate_changed_targets(
             raise _policy("changed target is unavailable") from error
         if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
             raise _policy("changed target is not a regular file")
-        if change.new_hunks:
+        if change.new_hunks or change.added:
             data = files.get(change.path)
             if data is None:
                 data = _read_regular(
@@ -574,6 +601,15 @@ def _validate_changed_targets(
                 checkout_lines = data.decode("utf-8").splitlines()
             except UnicodeDecodeError as error:
                 raise _policy("changed target is not UTF-8") from error
+            if change.added:
+                expected_checkout: list[str] = []
+                for new_start, expected_lines in change.new_hunks:
+                    if new_start != len(expected_checkout) + 1:
+                        raise _policy("diff does not match the source checkout")
+                    expected_checkout.extend(expected_lines)
+                if tuple(checkout_lines) != tuple(expected_checkout):
+                    raise _policy("diff does not match the source checkout")
+                continue
             for new_start, expected_lines in change.new_hunks:
                 if not expected_lines:
                     if not 0 <= new_start <= len(checkout_lines):
@@ -582,6 +618,22 @@ def _validate_changed_targets(
                 start = new_start - 1
                 if tuple(checkout_lines[start : start + len(expected_lines)]) != expected_lines:
                     raise _policy("diff does not match the source checkout")
+
+
+def _validate_deleted_target_absent(root: Path, relative: PurePosixPath) -> None:
+    current = root
+    try:
+        for part in relative.parts:
+            current = current / part
+            if stat.S_ISLNK(current.lstat().st_mode):
+                raise _policy("deleted target has a symlink ancestor")
+    except FileNotFoundError:
+        return
+    except TargetError:
+        raise
+    except OSError as error:
+        raise _policy("unable to validate deleted target") from error
+    raise _policy("deleted target still exists in source checkout")
 
 
 def _read_regular(

@@ -34,7 +34,7 @@ from aiweekend_target.agent_protocol import (
 )
 from aiweekend_target.errors import ErrorCode, TargetError
 from aiweekend_target.lab.config import GATEWAY_BASE_URL, MCP_URL, MODEL_PAIR
-from aiweekend_target.lab.review_prepare import ReviewChange, _git_paths, _header_path, parse_unified_diff
+from aiweekend_target.lab.review_prepare import ReviewChange, _git_paths, parse_unified_diff
 from aiweekend_target.lab.trace import safe_preview
 from aiweekend_target.repo_rag.lint import MAX_ADDED_LINES, MAX_TARGETS, LintTarget, validate_lint_response
 
@@ -123,17 +123,12 @@ def _digest_records(document: str, changes: tuple[ReviewChange, ...]) -> tuple[l
             old_path, new_path = _git_paths(header, record_lines)
         except TargetError as error:
             raise _ReviewFailure(error.code.value, "diff") from error
-        metadata = record_lines[:next((index for index, line in enumerate(record_lines) if line.startswith("@@ ")), len(record_lines))]
-        if old_path != new_path:
-            status = "renamed"
-        elif change.deleted:
+        if change.deleted:
             status = "deleted"
-        elif any(
-            line.startswith("new file mode ")
-            or line.startswith("--- ") and _header_path(line[4:], "a") is None
-            for line in metadata
-        ):
+        elif change.added:
             status = "added"
+        elif old_path != new_path:
+            status = "renamed"
         else:
             status = "modified"
         records.append(

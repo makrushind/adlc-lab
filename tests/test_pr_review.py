@@ -73,7 +73,7 @@ class PrepareReviewTests(unittest.TestCase):
         self.assertEqual(
             parse_unified_diff(document),
             (
-                ReviewChange("added-empty.py", (), False),
+                ReviewChange("added-empty.py", (), False, added=True),
                 ReviewChange("deleted-empty.py", (), True),
                 ReviewChange("script.py", (), False),
             ),
@@ -104,7 +104,7 @@ class PrepareReviewTests(unittest.TestCase):
 
         self.assertEqual(
             parse_unified_diff(document),
-            (ReviewChange("empty.py", (), False),),
+            (ReviewChange("empty.py", (), False, added=True),),
         )
 
     def test_rejects_incomplete_or_contradictory_metadata_only_records(self) -> None:
@@ -127,6 +127,7 @@ class PrepareReviewTests(unittest.TestCase):
         added = "diff --git a/new.py b/new.py\nnew file mode 100644\n--- /dev/null\n+++ b/new.py\n@@ -0,0 +1,2 @@\n+one\n+two\n"
         renamed = "diff --git a/old.py b/new.py\nsimilarity index 100%\nrename from old.py\nrename to new.py\n"
         self.assertEqual(parse_unified_diff(added)[0].added_lines, (1, 2))
+        self.assertTrue(parse_unified_diff(added)[0].added)
         self.assertEqual(parse_unified_diff(renamed)[0].path, "new.py")
         for malformed in (
             "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ bad @@\n",
@@ -409,6 +410,153 @@ class PrepareReviewTests(unittest.TestCase):
                 self.assertEqual((target / "sentinel.txt").read_text(encoding="utf-8"), target.name)
             self.assertFalse((paths.workspace / "pr.diff").exists())
 
+    def test_rejects_nonempty_checkout_for_metadata_only_empty_add_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            self._write(source, "new.py", "value = eval(source)\n")
+            diff = self._write(
+                root,
+                "pr.diff",
+                "diff --git a/new.py b/new.py\n"
+                "new file mode 100644\n"
+                "index 0000000..e69de29\n",
+            )
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+            self._write(paths.workspace, "sentinel.txt", "unchanged")
+
+            with self.assertRaises(TargetError) as raised:
+                prepare_review(paths, source, diff, marker)
+
+            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+            self.assertEqual((paths.workspace / "sentinel.txt").read_text(encoding="utf-8"), "unchanged")
+
+    def test_rejects_partial_added_file_hunk_that_omits_checkout_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            self._write(source, "new.py", "value = eval(source)\nsafe = 1\n")
+            diff = self._write(
+                root,
+                "pr.diff",
+                "diff --git a/new.py b/new.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/new.py\n"
+                "@@ -0,0 +2 @@\n"
+                "+safe = 1\n",
+            )
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+
+            with self.assertRaises(TargetError) as raised:
+                prepare_review(paths, source, diff, marker)
+
+            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+
+    def test_rejects_deleted_diff_when_target_still_exists_in_pr_head(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            self._write(source, "removed.py", "still here\n")
+            diff = self._write(
+                root,
+                "pr.diff",
+                "diff --git a/removed.py b/removed.py\n"
+                "--- a/removed.py\n"
+                "+++ /dev/null\n"
+                "@@ -1 +0,0 @@\n"
+                "-removed\n",
+            )
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+
+            with self.assertRaises(TargetError) as raised:
+                prepare_review(paths, source, diff, marker)
+
+            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+
+    def test_accepts_complete_empty_and_nonempty_adds_and_absent_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            self._write(source, "empty.py", "")
+            self._write(source, "new.py", "one\ntwo\n")
+            diff = self._write(
+                root,
+                "pr.diff",
+                "diff --git a/empty.py b/empty.py\n"
+                "new file mode 100644\n"
+                "index 0000000..e69de29\n"
+                "diff --git a/new.py b/new.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/new.py\n"
+                "@@ -0,0 +1,2 @@\n"
+                "+one\n"
+                "+two\n"
+                "diff --git a/removed.py b/removed.py\n"
+                "deleted file mode 100644\n"
+                "index e69de29..0000000\n",
+            )
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+
+            result = prepare_review(paths, source, diff, marker)
+
+            self.assertTrue(result["prepared"])
+            self.assertEqual(result["changed_files"], 3)
+
+    def test_malformed_large_numeric_and_octal_fields_are_policy_errors(self) -> None:
+        digits = "9" * 5_000
+        documents = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            f"@@ -1 +{digits} @@\n"
+            "-old\n"
+            "+new\n",
+            "diff --git a/old.py b/new.py\n"
+            f"similarity index {digits}%\n"
+            "rename from old.py\n"
+            "rename to new.py\n",
+            'diff --git "a/\\777.py" "b/\\777.py"\n'
+            '--- "a/\\777.py"\n'
+            '+++ "b/\\777.py"\n'
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n",
+        )
+        for document in documents:
+            with self.subTest(prefix=document[:32]):
+                with self.assertRaises(TargetError) as raised:
+                    parse_unified_diff(document)
+                self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+
+    def test_accepts_maximum_bounded_hunk_number_and_percentage(self) -> None:
+        maximum = (1 << 63) - 1
+        hunk = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            f"@@ -1 +{maximum} @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        rename = (
+            "diff --git a/old.py b/new.py\n"
+            "similarity index 100%\n"
+            "rename from old.py\n"
+            "rename to new.py\n"
+        )
+        self.assertEqual(parse_unified_diff(hunk)[0].added_lines, (maximum,))
+        self.assertEqual(parse_unified_diff(rename)[0].path, "new.py")
+
     def test_rejects_empty_new_side_hunk_outside_checkout_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -528,7 +676,7 @@ class PrepareReviewTests(unittest.TestCase):
 
         self.assertEqual(
             parse_unified_diff(document),
-            (ReviewChange("notes.py", (1, 2), False),),
+            (ReviewChange("notes.py", (1, 2), False, added=True),),
         )
 
     def test_rejects_missing_changed_target(self) -> None:
@@ -1201,14 +1349,14 @@ class PullRequestReviewLoopTests(unittest.TestCase):
                 )
                 self.assertIn('"status":"added","path":"plain.md"', self._prompt(document))
 
-    def test_digest_omits_an_excerpt_when_hunk_line_metadata_alone_exceeds_its_cap(self) -> None:
-        enormous_start = "9" * 1_100
+    def test_digest_omits_an_excerpt_when_metadata_alone_exceeds_its_cap(self) -> None:
+        enormous_path = "x" * 1_100 + ".md"
         document = (
-            "diff --git a/huge.md b/huge.md\n"
+            f"diff --git a/{enormous_path} b/{enormous_path}\n"
             "new file mode 100644\n"
             "--- /dev/null\n"
-            "+++ b/huge.md\n"
-            f"@@ -0,0 +{enormous_start},1 @@\n"
+            f"+++ b/{enormous_path}\n"
+            "@@ -0,0 +1 @@\n"
             "+x\n"
             + self._added_lines_diff("padding.md", ["x"] * 12_000)
         )
@@ -1216,7 +1364,7 @@ class PullRequestReviewLoopTests(unittest.TestCase):
         excerpt_records = [json.loads(line) for line in prompt.splitlines() if line.startswith('{"path":')]
         self.assertTrue(excerpt_records)
         self.assertTrue(all(len(json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 1024 for record in excerpt_records))
-        self.assertNotIn(f'"line":{enormous_start},', prompt)
+        self.assertNotIn(f'{{"path":"{enormous_path}","line":1,', prompt)
         self.assertGreater(int(re.search(r"OMITTED_LINES count=(\d+)", prompt).group(1)), 0)
         self.assertGreater(int(re.search(r"OMITTED_BYTES count=(\d+)", prompt).group(1)), 0)
 
@@ -1696,3 +1844,32 @@ class PullRequestReviewLoopTests(unittest.TestCase):
                     [json.loads(line) for line in output.getvalue().splitlines()],
                     [{"schema": 1, "type": "pr_review_error", "ok": False, "code": "POLICY", "stage": "diff"}],
                 )
+
+    def test_malformed_numeric_and_octal_diffs_fail_as_policy_at_diff_boundary(self) -> None:
+        digits = "9" * 5_000
+        documents = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            f"@@ -1 +{digits} @@\n"
+            "-old\n"
+            "+new\n",
+            "diff --git a/old.py b/new.py\n"
+            f"similarity index {digits}%\n"
+            "rename from old.py\n"
+            "rename to new.py\n",
+            'diff --git "a/\\777.py" "b/\\777.py"\n'
+            '--- "a/\\777.py"\n'
+            '+++ "b/\\777.py"\n'
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n",
+        )
+        for document in documents:
+            with self.subTest(prefix=document[:32]):
+                status, requests, events, session, order = self._exercise(diff=document)
+                self.assertEqual(status, 1)
+                self.assertEqual(requests, [])
+                self.assertEqual(session.calls, [])
+                self.assertEqual(order, [])
+                self.assertEqual(events, [{"schema": 1, "type": "pr_review_error", "ok": False, "code": "POLICY", "stage": "diff"}])
