@@ -180,6 +180,40 @@ jobs:
               raise SystemExit("PR review input bind mismatch")
           if pr_review["services"]["repo-rag"].get("environment") != {"ADLC_PR_REVIEW_MODE": "1"}:
               raise SystemExit("PR review mode environment mismatch")
+
+          expected_review_named_mounts = {
+              ("reset", "workspace", "/target/workspace"): False,
+              ("reset", "corpus", "/target/corpus"): False,
+              ("reset", "rag_index", "/target/rag-index"): False,
+              ("repo-rag", "corpus", "/target/corpus"): True,
+              ("repo-rag", "rag_index", "/target/rag-index"): True,
+              ("agent", "workspace", "/target/workspace"): True,
+              ("agent", "corpus", "/target/corpus"): True,
+              ("agent", "rag_index", "/target/rag-index"): True,
+          }
+
+          def named_mounts(model):
+              return {
+                  (service_name, mount.get("source"), mount.get("target")): mount
+                  for service_name, service in model["services"].items()
+                  for mount in service.get("volumes", [])
+                  if mount.get("type") == "volume"
+              }
+
+          base_named_mounts = named_mounts(base)
+          review_named_mounts = named_mounts(pr_review)
+          if set(review_named_mounts) != set(expected_review_named_mounts):
+              raise SystemExit("PR review named mount set mismatch")
+          for key, expected_read_only in expected_review_named_mounts.items():
+              base_mount = base_named_mounts.get(key)
+              review_mount = review_named_mounts[key]
+              if base_mount is None or review_mount.get("read_only", False) != expected_read_only:
+                  raise SystemExit(f"PR review named mount access mismatch: {key!r}")
+              if review_mount.get("read_only", False) != base_mount.get("read_only", False):
+                  raise SystemExit(f"PR review named mount changed access: {key!r}")
+              if review_mount.get("bind", {}).get("selinux") != "z":
+                  raise SystemExit(f"PR review named mount SELinux mode mismatch: {key!r}")
+
           normalized_review = copy.deepcopy(pr_review)
           normalized_review["services"]["reset"]["volumes"] = [
               mount
@@ -187,8 +221,19 @@ jobs:
               if mount.get("type") != "bind"
           ]
           normalized_review["services"]["repo-rag"].pop("environment", None)
+          for service_name, source, target in expected_review_named_mounts:
+              mount = next(
+                  mount
+                  for mount in normalized_review["services"][service_name].get("volumes", [])
+                  if mount.get("type") == "volume"
+                  and mount.get("source") == source
+                  and mount.get("target") == target
+              )
+              mount["bind"].pop("selinux")
+              if not mount["bind"]:
+                  mount.pop("bind")
           if normalized_review != base:
-              raise SystemExit("PR review overlay changes more than its two inputs and mode flag")
+              raise SystemExit("PR review overlay changes more than its two inputs, mode flag, and SELinux mount modes")
 
           root = Path(".")
           retired = "open" + "code"

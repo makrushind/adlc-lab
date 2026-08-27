@@ -13,7 +13,19 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - workspace:/target/workspace:z
+      - corpus:/target/corpus:z
+      - rag_index:/target/rag-index:z
 
   repo-rag:
     environment:
       ADLC_PR_REVIEW_MODE: "1"
+    volumes:
+      - corpus:/target/corpus:ro,z
+      - rag_index:/target/rag-index:ro,z
+
+  agent:
+    volumes:
+      - workspace:/target/workspace:ro,z
+      - corpus:/target/corpus:ro,z
+      - rag_index:/target/rag-index:ro,z
