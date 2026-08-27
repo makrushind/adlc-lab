@@ -52,7 +52,9 @@ def _request_metadata(body: Mapping[str, object]) -> dict[str, object]:
         tool_choice_kind = "unset"
     else:
         tool_choice_kind = "other"
-    output_token_cap = body.get("max_tokens")
+    output_token_cap = body.get("max_completion_tokens")
+    if type(output_token_cap) is not int or output_token_cap < 0:
+        output_token_cap = body.get("max_tokens")
     if type(output_token_cap) is not int or output_token_cap < 0:
         output_token_cap = None
     return {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +18,7 @@ CHAT_URL = f"{ROUTER_URL}/chat/completions"
 PROBE_TIMEOUT = httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)
 CHAT_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)
 MAX_ERROR_SAMPLE_BYTES = 16 * 1024
+_SAFE_UPSTREAM_FIELD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 
 
 @dataclass(frozen=True)
@@ -50,11 +52,18 @@ def _provider_error() -> TargetError:
     return TargetError(ErrorCode.PROVIDER, "Hugging Face Router is unavailable")
 
 
-def _declared_error_body_exceeds_cap(response: httpx.Response) -> bool:
+def _declared_error_body_length(response: httpx.Response) -> int | None:
     try:
-        return int(response.headers.get("content-length", "")) > MAX_ERROR_SAMPLE_BYTES
+        length = int(response.headers.get("content-length", ""))
     except ValueError:
-        return False
+        return None
+    return length if length >= 0 else None
+
+
+def _safe_upstream_field(value: object) -> str | None:
+    if type(value) is str and _SAFE_UPSTREAM_FIELD.fullmatch(value) is not None:
+        return value
+    return None
 
 
 def _error_diagnostics(status_code: int, sample: bytes, truncated: bool) -> dict[str, object]:
@@ -70,12 +79,9 @@ def _error_diagnostics(status_code: int, sample: bytes, truncated: bool) -> dict
         has_failed_generation = "failed_generation" in payload
         error = payload.get("error")
         if isinstance(error, Mapping):
-            value = error.get("type")
-            error_type = value if isinstance(value, str) else None
-            value = error.get("code")
-            error_code = value if isinstance(value, str) else None
-            value = error.get("param")
-            error_param = value if isinstance(value, str) else None
+            error_type = _safe_upstream_field(error.get("type"))
+            error_code = _safe_upstream_field(error.get("code"))
+            error_param = _safe_upstream_field(error.get("param"))
     return {
         "status": status_code,
         "error_type": error_type,
@@ -89,19 +95,22 @@ def _error_diagnostics(status_code: int, sample: bytes, truncated: bool) -> dict
 
 
 async def _bounded_error_diagnostics(response: httpx.Response) -> dict[str, object]:
+    declared_length = _declared_error_body_length(response)
+    if declared_length is not None and declared_length > MAX_ERROR_SAMPLE_BYTES:
+        return _error_diagnostics(response.status_code, b"", True)
     sample = bytearray()
-    truncated = _declared_error_body_exceeds_cap(response)
-    async for chunk in response.aiter_raw():
+    truncated = False
+    async for chunk in response.aiter_raw(chunk_size=MAX_ERROR_SAMPLE_BYTES):
         remaining = MAX_ERROR_SAMPLE_BYTES - len(sample)
-        if remaining <= 0:
-            if chunk:
-                truncated = True
-            break
         if len(chunk) > remaining:
             sample.extend(chunk[:remaining])
             truncated = True
             break
         sample.extend(chunk)
+        if response.num_bytes_downloaded > MAX_ERROR_SAMPLE_BYTES:
+            truncated = True
+        if len(sample) == MAX_ERROR_SAMPLE_BYTES:
+            break
     return _error_diagnostics(response.status_code, bytes(sample), truncated)
 
 

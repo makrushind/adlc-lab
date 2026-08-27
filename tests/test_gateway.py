@@ -9,7 +9,7 @@ import httpx
 from aiweekend_target.__main__ import _health
 from aiweekend_target.errors import ErrorCode, TargetError
 from aiweekend_target.gateway.app import create_app
-from aiweekend_target.gateway.transport import _upstream_error, probe_available
+from aiweekend_target.gateway.transport import _bounded_error_diagnostics, _upstream_error, probe_available
 from aiweekend_target.lab.config import MODEL_PAIR
 
 
@@ -45,6 +45,85 @@ class GatewayErrorTests(unittest.TestCase):
         with self.assertRaises(TargetError) as captured:
             asyncio.run(probe_available("secret", ClosingTransport()))
         self.assertEqual(captured.exception.code, ErrorCode.PROVIDER)
+
+    def test_declared_oversized_error_body_is_not_requested_from_the_source(self) -> None:
+        delivered: list[int] = []
+
+        class ResponseStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                delivered.append(16 * 1024 + 1)
+                yield b"x" * (16 * 1024 + 1)
+
+            async def aclose(self) -> None:
+                return None
+
+        async def exercise() -> dict[str, object]:
+            response = httpx.Response(400, headers={"content-length": str(16 * 1024 + 1)}, stream=ResponseStream())
+            try:
+                return await _bounded_error_diagnostics(response)
+            finally:
+                await response.aclose()
+
+        diagnostics = asyncio.run(exercise())
+        self.assertEqual(delivered, [])
+        self.assertEqual(diagnostics, {
+            "status": 400,
+            "error_type": None,
+            "error_code": None,
+            "error_param": None,
+            "has_failed_generation": False,
+            "sample_bytes": 0,
+            "sample_sha256": hashlib.sha256(b"").hexdigest(),
+            "truncated": True,
+        })
+
+    def test_error_diagnostics_do_not_fetch_after_an_exact_unknown_cap(self) -> None:
+        delivered: list[int] = []
+
+        class ResponseStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                delivered.append(16 * 1024)
+                yield b"x" * (16 * 1024)
+                delivered.append(1)
+                yield b"y"
+
+            async def aclose(self) -> None:
+                return None
+
+        async def exercise() -> dict[str, object]:
+            response = httpx.Response(400, stream=ResponseStream())
+            try:
+                return await _bounded_error_diagnostics(response)
+            finally:
+                await response.aclose()
+
+        diagnostics = asyncio.run(exercise())
+        self.assertEqual(delivered, [16 * 1024])
+        self.assertEqual(diagnostics["sample_bytes"], 16 * 1024)
+        self.assertEqual(diagnostics["truncated"], False)
+
+    def test_error_diagnostics_expose_an_oversized_source_chunk_without_retaining_it(self) -> None:
+        delivered: list[int] = []
+
+        class ResponseStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                delivered.append(16 * 1024 + 1)
+                yield b"x" * (16 * 1024 + 1)
+
+            async def aclose(self) -> None:
+                return None
+
+        async def exercise() -> dict[str, object]:
+            response = httpx.Response(400, stream=ResponseStream())
+            try:
+                return await _bounded_error_diagnostics(response)
+            finally:
+                await response.aclose()
+
+        diagnostics = asyncio.run(exercise())
+        self.assertEqual(delivered, [16 * 1024 + 1])
+        self.assertEqual(diagnostics["sample_bytes"], 16 * 1024)
+        self.assertEqual(diagnostics["truncated"], True)
 
     def test_health_command_unwraps_a_canonical_gateway_readiness_failure(self) -> None:
         class Response:
@@ -206,6 +285,20 @@ class GatewayChatAsgiTests(unittest.TestCase):
                 False,
             ),
             (
+                "unsafe error fields",
+                json.dumps(
+                    {
+                        "error": {"type": canary, "code": canary, "param": canary, "message": credential},
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                None,
+                None,
+                None,
+                False,
+                False,
+            ),
+            (
                 "oversized body",
                 (f'{canary} {credential} '.encode("utf-8") * 1_000),
                 None,
@@ -251,6 +344,7 @@ class GatewayChatAsgiTests(unittest.TestCase):
                 ],
                 "tool_choice": {"type": "function", "function": {"name": "search_repo"}},
                 "max_tokens": 73,
+                "max_completion_tokens": 47,
                 "stream": False,
             }
             with patch("aiweekend_target.gateway.app.read_secret", return_value=secret):
@@ -268,6 +362,7 @@ class GatewayChatAsgiTests(unittest.TestCase):
             "tools": [{"type": "function", "function": {"name": "search_repo", "description": f"{canary} {credential}"}}],
             "tool_choice": {"type": "function", "function": {"name": "search_repo"}},
             "max_tokens": 73,
+            "max_completion_tokens": 47,
             "stream": False,
         }
         expected_request = json.dumps(expected_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -307,20 +402,21 @@ class GatewayChatAsgiTests(unittest.TestCase):
             self.assertEqual(entry["message_bytes"], expected_message_bytes)
             self.assertEqual(entry["tool_choice_kind"], "named")
             self.assertEqual(entry["tool_schema_sha256"], expected_tool_hash)
-            self.assertEqual(entry["output_token_cap"], 73)
+            self.assertEqual(entry["output_token_cap"], 47)
 
         error_logs = [entry for entry in logs if entry["type"] == "gateway_error"]
         self.assertEqual(len(error_logs), len(bodies))
         for entry, expected in zip(error_logs, bodies, strict=True):
             _, response_body, error_type, error_code, error_param, has_failed_generation, truncated = expected
+            retained_sample = b"" if len(response_body) > 16 * 1024 else response_body
             self.assertEqual(entry["upstream"], {
                 "status": 400,
                 "error_type": error_type,
                 "error_code": error_code,
                 "error_param": error_param,
                 "has_failed_generation": has_failed_generation,
-                "sample_bytes": min(len(response_body), 16 * 1024),
-                "sample_sha256": hashlib.sha256(response_body[: 16 * 1024]).hexdigest(),
+                "sample_bytes": len(retained_sample),
+                "sample_sha256": hashlib.sha256(retained_sample).hexdigest(),
                 "truncated": truncated,
             })
         rendered_logs = json.dumps(logs, separators=(",", ":"))
