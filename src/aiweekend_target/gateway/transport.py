@@ -17,6 +17,7 @@ CHAT_URL = f"{ROUTER_URL}/chat/completions"
 PROBE_TIMEOUT = httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)
 CHAT_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)
 MAX_ERROR_SAMPLE_BYTES = 16 * 1024
+MAX_CONTENT_LENGTH_DIGITS = 20
 _SAFE_ERROR_TYPES = frozenset({
     "authentication_error",
     "generation_error",
@@ -83,7 +84,13 @@ def _provider_error() -> TargetError:
 
 def _declared_error_body_length(response: httpx.Response) -> int | None:
     value = response.headers.get("content-length")
-    if type(value) is not str or not value or not value.isascii() or not value.isdecimal():
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > MAX_CONTENT_LENGTH_DIGITS
+        or not value.isascii()
+        or not value.isdecimal()
+    ):
         return None
     return int(value)
 

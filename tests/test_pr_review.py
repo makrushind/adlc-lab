@@ -763,6 +763,41 @@ class RepoRagChunkTests(unittest.TestCase):
             self.assertTrue(chunk_sizes)
             self.assertLessEqual(max(chunk_sizes), 8 * 1024)
 
+    def test_keeps_multibyte_token_searchable_when_it_straddles_byte_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            corpus = root / "corpus"
+            corpus.mkdir()
+            token = "crossboundaryneedle"
+            prefix = "é" * 4_090 + ":"
+            token_start = len(prefix.encode("utf-8"))
+            self.assertLess(token_start, 8 * 1024)
+            self.assertGreater(token_start + len(token.encode("utf-8")), 8 * 1024)
+            self.assertLessEqual(len(token.encode("utf-8")), 256)
+            (corpus / "boundary.json").write_text(prefix + token + ":tail\n", encoding="utf-8")
+            databases = (root / "first.sqlite", root / "second.sqlite")
+            indexed_rows: list[list[tuple[str, int, int, str]]] = []
+
+            for database in databases:
+                build_index(corpus, database)
+                with sqlite3.connect(database) as connection:
+                    indexed_rows.append(
+                        connection.execute(
+                            "SELECT path, line_start, line_end, content FROM chunks ORDER BY rowid"
+                        ).fetchall()
+                    )
+
+            response = RepoSearch(databases[0]).search_repo(token)
+
+            self.assertEqual(indexed_rows[0], indexed_rows[1])
+            self.assertTrue(indexed_rows[0])
+            for path, line_start, line_end, content in indexed_rows[0]:
+                self.assertEqual((path, line_start, line_end), ("boundary.json", 1, 1))
+                self.assertLessEqual(len(content.encode("utf-8")), 8 * 1024)
+            self.assertEqual(len(response["results"]), 1)
+            self.assertIn(token, response["results"][0]["content"])
+            self.assertEqual(validate_search_response(response), response)
+
     def test_preserves_line_count_chunking_when_content_is_under_the_byte_cap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

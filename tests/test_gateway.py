@@ -244,6 +244,51 @@ class GatewayChatAsgiTests(unittest.TestCase):
             {"ok": False, "error": {"code": "PROVIDER", "message": "Hugging Face Router is unavailable", "details": None}, "exit_code": 1},
         )
 
+    def test_pathological_digit_only_content_length_returns_canonical_error_without_reading_body(self) -> None:
+        delivered: list[int] = []
+
+        class ResponseStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                delivered.append(1)
+                yield b"x"
+
+            async def aclose(self) -> None:
+                return None
+
+        def handler(_: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                400,
+                headers={"content-length": "9" * 5_000},
+                stream=ResponseStream(),
+            )
+
+        async def exercise() -> httpx.Response:
+            app = create_app(transport=httpx.MockTransport(handler))
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            with patch("aiweekend_target.gateway.app.read_secret", return_value="placeholder"):
+                async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+                    return await client.post(
+                        "/v1/chat/completions",
+                        json={"model": MODEL_PAIR, "messages": []},
+                    )
+
+        response = asyncio.run(exercise())
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json(),
+            {
+                "ok": False,
+                "error": {
+                    "code": "PROVIDER",
+                    "message": "Hugging Face Router request failed",
+                    "details": {"upstream_status": 400},
+                },
+                "exit_code": 1,
+            },
+        )
+        self.assertEqual(delivered, [])
+
     def test_chat_upstream_failures_log_only_bounded_redacted_transport_metadata(self) -> None:
         canary = "CANARY_HF_GATEWAY_TRANSPORT_MUST_NOT_APPEAR"
         credential = "hf_transport_credential_must_not_appear"

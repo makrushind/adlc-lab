@@ -12,6 +12,9 @@ from aiweekend_target.errors import ErrorCode, TargetError
 CHUNK_LINES = 40
 CHUNK_OVERLAP = 10
 MAX_CHUNK_BYTES = 8 * 1024
+# Agent queries are capped at 256 UTF-8 bytes, so a crossing token needs at most the preceding 255 bytes.
+MAX_SEARCH_TOKEN_BYTES = 256
+CHUNK_BYTE_OVERLAP = MAX_SEARCH_TOKEN_BYTES - 1
 
 
 def build_index(corpus_root: str | Path, database_path: str | Path) -> None:
@@ -140,16 +143,24 @@ def _bounded_window(lines: list[str], first_line: int) -> list[tuple[int, int, s
 
 def _split_utf8(value: str) -> list[str]:
     parts: list[str] = []
-    characters: list[str] = []
+    start = 0
+    end = 0
     size = 0
-    for character in value:
+    while end < len(value):
+        character = value[end]
         character_size = len(character.encode("utf-8"))
-        if characters and size + character_size > MAX_CHUNK_BYTES:
-            parts.append("".join(characters))
-            characters = []
-            size = 0
-        characters.append(character)
+        if end > start and size + character_size > MAX_CHUNK_BYTES:
+            parts.append(value[start:end])
+            overlap_start = end
+            overlap_size = 0
+            while overlap_start > start and overlap_size < CHUNK_BYTE_OVERLAP:
+                overlap_start -= 1
+                overlap_size += len(value[overlap_start].encode("utf-8"))
+            start = overlap_start
+            size = overlap_size
+            continue
         size += character_size
-    if characters:
-        parts.append("".join(characters))
+        end += 1
+    if end > start:
+        parts.append(value[start:end])
     return parts
