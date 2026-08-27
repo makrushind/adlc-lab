@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import anyio
+from aiweekend_target.lab import review_prepare as review_prepare_module
 from aiweekend_target.errors import ErrorCode, TargetError
 from aiweekend_target.agent_protocol import validate_search_response
 from aiweekend_target.lab.review_prepare import ReviewChange, parse_unified_diff, prepare_review
@@ -479,6 +480,191 @@ class PrepareReviewTests(unittest.TestCase):
                 prepare_review(paths, source, diff, marker)
 
             self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+
+    def test_rejects_deleted_snapshot_removed_before_live_validation_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            target = self._write(source, "removed.py", "stale snapshot\n")
+            diff = self._write(
+                root,
+                "pr.diff",
+                "diff --git a/removed.py b/removed.py\n"
+                "--- a/removed.py\n"
+                "+++ /dev/null\n"
+                "@@ -1 +0,0 @@\n"
+                "-stale snapshot\n",
+            )
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+            for volume in (paths.workspace, paths.corpus, paths.rag_index):
+                self._write(volume, "sentinel.txt", volume.name)
+            validate = review_prepare_module._validate_changed_targets
+            mutated = False
+
+            def remove_then_validate(changes: object, checkout: Path, files: object) -> None:
+                nonlocal mutated
+                target.unlink()
+                mutated = True
+                validate(changes, checkout, files)
+
+            caught: TargetError | None = None
+            with mock.patch.object(review_prepare_module, "_validate_changed_targets", side_effect=remove_then_validate):
+                try:
+                    prepare_review(paths, source, diff, marker)
+                except TargetError as error:
+                    caught = error
+
+            self.assertTrue(mutated)
+            if caught is None:
+                self.assertEqual((paths.corpus / "removed.py").read_bytes(), b"stale snapshot\n")
+                self.fail("stale checkout bytes were staged after the deleted target disappeared")
+            self.assertEqual(caught.code, ErrorCode.POLICY)
+            for volume in (paths.workspace, paths.corpus, paths.rag_index):
+                self.assertEqual((volume / "sentinel.txt").read_text(encoding="utf-8"), volume.name)
+
+    def test_rejects_added_file_final_newline_mismatches_without_mutation(self) -> None:
+        cases = (
+            (b"one\n", "+one\n\\ No newline at end of file\n", "diff claims no final newline"),
+            (b"one", "+one\n", "diff implies a final newline"),
+        )
+        for checkout, body, label in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source"
+                source.mkdir()
+                self._write(source, "new.py", checkout)
+                diff = self._write(
+                    root,
+                    "pr.diff",
+                    "diff --git a/new.py b/new.py\n"
+                    "new file mode 100644\n"
+                    "--- /dev/null\n"
+                    "+++ b/new.py\n"
+                    "@@ -0,0 +1 @@\n"
+                    + body,
+                )
+                marker = self._write(root, "marker.json", "{}")
+                paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+                for volume in (paths.workspace, paths.corpus, paths.rag_index):
+                    self._write(volume, "sentinel.txt", volume.name)
+
+                with self.assertRaises(TargetError) as raised:
+                    prepare_review(paths, source, diff, marker)
+
+                self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+                for volume in (paths.workspace, paths.corpus, paths.rag_index):
+                    self.assertEqual((volume / "sentinel.txt").read_text(encoding="utf-8"), volume.name)
+
+    def test_accepts_empty_and_exact_newline_states_for_added_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            expected = {
+                "empty.py": b"",
+                "newline.py": b"one\n",
+                "no-newline.py": b"two",
+            }
+            for relative, data in expected.items():
+                self._write(source, relative, data)
+            diff = self._write(
+                root,
+                "pr.diff",
+                "diff --git a/empty.py b/empty.py\n"
+                "new file mode 100644\n"
+                "index 0000000..e69de29\n"
+                "diff --git a/newline.py b/newline.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/newline.py\n"
+                "@@ -0,0 +1 @@\n"
+                "+one\n"
+                "diff --git a/no-newline.py b/no-newline.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/no-newline.py\n"
+                "@@ -0,0 +1 @@\n"
+                "+two\n"
+                "\\ No newline at end of file\n",
+            )
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+
+            result = prepare_review(paths, source, diff, marker)
+
+            self.assertEqual(result["changed_files"], 3)
+            for relative, data in expected.items():
+                self.assertEqual((paths.corpus / relative).read_bytes(), data)
+
+    def test_accepts_crlf_and_unicode_line_separator_content_in_added_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            expected = {
+                "crlf.py": b"one\r\ntwo\r\n",
+                "unicode.py": "left\u2028right\n".encode("utf-8"),
+            }
+            for relative, data in expected.items():
+                self._write(source, relative, data)
+            diff = self._write(
+                root,
+                "pr.diff",
+                "diff --git a/crlf.py b/crlf.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/crlf.py\n"
+                "@@ -0,0 +1,2 @@\n"
+                "+one\r\n"
+                "+two\r\n"
+                "diff --git a/unicode.py b/unicode.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/unicode.py\n"
+                "@@ -0,0 +1 @@\n"
+                "+left\u2028right\n",
+            )
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+
+            try:
+                result = prepare_review(paths, source, diff, marker)
+            except TargetError as error:
+                self.fail(f"valid LF-delimited Git diff content was rejected: {error}")
+
+            self.assertEqual(result["changed_files"], 2)
+            for relative, data in expected.items():
+                self.assertEqual((paths.corpus / relative).read_bytes(), data)
+
+    def test_preserves_added_file_final_newline_state(self) -> None:
+        newline = (
+            "diff --git a/new.py b/new.py\n"
+            "--- /dev/null\n"
+            "+++ b/new.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+one\n"
+        )
+        no_newline = newline + "\\ No newline at end of file\n"
+
+        self.assertIs(getattr(parse_unified_diff(newline)[0], "new_ends_with_newline", None), True)
+        self.assertIs(getattr(parse_unified_diff(no_newline)[0], "new_ends_with_newline", None), False)
+
+    def test_rejects_no_newline_marker_before_later_new_side_content(self) -> None:
+        incoherent = (
+            "diff --git a/new.py b/new.py\n"
+            "--- /dev/null\n"
+            "+++ b/new.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+one\n"
+            "\\ No newline at end of file\n"
+            "+two\n"
+        )
+
+        with self.assertRaises(TargetError) as raised:
+            parse_unified_diff(incoherent)
+        self.assertEqual(raised.exception.code, ErrorCode.POLICY)
 
     def test_accepts_complete_empty_and_nonempty_adds_and_absent_delete(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1264,6 +1450,20 @@ class PullRequestReviewLoopTests(unittest.TestCase):
         self.assertIn("OMITTED_BYTES count=", prompt)
         self.assertNotIn("\t" * 12_000, prompt)
         self.assertNotIn("é" * 100_000, prompt)
+
+    def test_large_digest_treats_unicode_line_separator_as_hunk_content(self) -> None:
+        content = "left\u2028diff --git a/fake.md b/fake.md"
+        document = self._added_lines_diff("special.md", [content]) + self._added_lines_diff(
+            "padding.md", ["x"] * 12_000
+        )
+
+        try:
+            prompt = self._prompt(document)
+        except TargetError as error:
+            self.fail(f"valid LF-delimited Git diff content was rejected: {error}")
+
+        self.assertIn('"path":"special.md","old_path":"special.md","new_path":"special.md"', prompt)
+        self.assertIn('"path":"padding.md","old_path":"padding.md","new_path":"padding.md"', prompt)
 
     def test_digest_is_deterministic_and_carries_change_metadata_and_hunks(self) -> None:
         document = (

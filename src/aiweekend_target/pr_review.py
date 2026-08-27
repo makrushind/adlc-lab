@@ -108,7 +108,9 @@ def _digest_records(document: str, changes: tuple[ReviewChange, ...]) -> tuple[l
     """Collect stable, validated file metadata and literal added-line excerpts."""
     records: list[dict[str, object]] = []
     excerpts: list[list[dict[str, object]]] = []
-    lines = document.splitlines()
+    lines = document.split("\n")
+    if lines[-1] == "":
+        lines.pop()
     position = 0
     for change in changes:
         if position >= len(lines) or not lines[position].startswith("diff --git "):

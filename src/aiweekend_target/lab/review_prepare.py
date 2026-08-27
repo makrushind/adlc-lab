@@ -45,6 +45,7 @@ class ReviewChange:
     deleted: bool
     new_hunks: tuple[tuple[int, tuple[str, ...]], ...] = field(default=(), compare=False, repr=False)
     added: bool = False
+    new_ends_with_newline: bool | None = field(default=None, compare=False, repr=False)
 
 
 def parse_unified_diff(document: str) -> tuple[ReviewChange, ...]:
@@ -58,7 +59,9 @@ def parse_unified_diff(document: str) -> tuple[ReviewChange, ...]:
     if len(encoded) > _MAX_DIFF_BYTES:
         raise _policy("diff is binary or oversized")
 
-    lines = document.splitlines()
+    lines = document.split("\n")
+    if lines[-1] == "":
+        lines.pop()
     changes: list[ReviewChange] = []
     seen_record_paths: set[str] = set()
     position = 0
@@ -249,6 +252,8 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
     new_hunks: list[tuple[int, tuple[str, ...]]] = []
     saw_hunk = False
     saw_content_change = False
+    old_has_no_final_newline = False
+    new_has_no_final_newline = False
     while position < len(record):
         line = record[position]
         if not line.startswith("@@ "):
@@ -262,26 +267,35 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
         old_seen = 0
         new_seen = 0
         new_side: list[str] = []
-        previous_was_content = False
+        previous_sides: tuple[bool, bool] | None = None
         while position < len(record) and not record[position].startswith("@@ "):
             body = record[position]
             if body.startswith("+"):
+                if new_has_no_final_newline:
+                    raise _policy("diff has an incoherent no-newline marker")
                 new_seen += 1
                 new_side.append(body[1:])
                 added.append(new_start + new_seen - 1)
-                previous_was_content = True
+                previous_sides = (False, True)
                 saw_content_change = True
             elif body.startswith("-"):
+                if old_has_no_final_newline:
+                    raise _policy("diff has an incoherent no-newline marker")
                 old_seen += 1
-                previous_was_content = True
+                previous_sides = (True, False)
                 saw_content_change = True
             elif body.startswith(" "):
+                if old_has_no_final_newline or new_has_no_final_newline:
+                    raise _policy("diff has an incoherent no-newline marker")
                 old_seen += 1
                 new_seen += 1
                 new_side.append(body[1:])
-                previous_was_content = True
-            elif body == "\\ No newline at end of file" and previous_was_content:
-                previous_was_content = False
+                previous_sides = (True, True)
+            elif body == "\\ No newline at end of file" and previous_sides is not None:
+                previous_old, previous_new = previous_sides
+                old_has_no_final_newline = old_has_no_final_newline or previous_old
+                new_has_no_final_newline = new_has_no_final_newline or previous_new
+                previous_sides = None
             else:
                 raise _policy("diff has malformed hunk content")
             position += 1
@@ -294,12 +308,14 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
     target = old_header if deleted else new_header
     if target is None:
         raise _policy("diff has malformed file headers")
+    new_ends_with_newline = False if new_has_no_final_newline else True if added_file else None
     return ReviewChange(
         target,
         tuple(sorted(set(added))),
         deleted,
         tuple(new_hunks),
         added=added_file,
+        new_ends_with_newline=new_ends_with_newline,
     )
 
 
@@ -571,6 +587,8 @@ def _validate_changed_targets(
             raise _policy("changed target is excluded from the review corpus")
         target = root.joinpath(*relative.parts)
         if change.deleted:
+            if change.path in files:
+                raise _policy("deleted target was present in the source checkout snapshot")
             _validate_deleted_target_absent(root, relative)
             continue
         if change.path.endswith(".py") and change.path not in files:
@@ -597,19 +615,24 @@ def _validate_changed_targets(
                     containment_root=resolved_root,
                     root_identity=_directory_identity(resolved_root.lstat()),
                 )
-            try:
-                checkout_lines = data.decode("utf-8").splitlines()
-            except UnicodeDecodeError as error:
-                raise _policy("changed target is not UTF-8") from error
             if change.added:
                 expected_checkout: list[str] = []
                 for new_start, expected_lines in change.new_hunks:
                     if new_start != len(expected_checkout) + 1:
                         raise _policy("diff does not match the source checkout")
                     expected_checkout.extend(expected_lines)
-                if tuple(checkout_lines) != tuple(expected_checkout):
+                if expected_checkout and change.new_ends_with_newline is None:
+                    raise _policy("diff does not match the source checkout")
+                expected_data = "\n".join(expected_checkout).encode("utf-8")
+                if expected_checkout and change.new_ends_with_newline:
+                    expected_data += b"\n"
+                if data != expected_data:
                     raise _policy("diff does not match the source checkout")
                 continue
+            try:
+                checkout_lines = data.decode("utf-8").splitlines()
+            except UnicodeDecodeError as error:
+                raise _policy("changed target is not UTF-8") from error
             for new_start, expected_lines in change.new_hunks:
                 if not expected_lines:
                     if not 0 <= new_start <= len(checkout_lines):
