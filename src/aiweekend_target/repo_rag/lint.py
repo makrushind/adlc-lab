@@ -49,6 +49,7 @@ def lint_pr(corpus_root: str | Path, targets: object) -> LintResponse:
         except SyntaxError as error:
             raise TargetError(ErrorCode.POLICY, "changed Python target is not syntactically valid") from error
         added_lines = set(target["added_lines"])
+        source_lines = source.splitlines()
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Call)
@@ -60,7 +61,7 @@ def lint_pr(corpus_root: str | Path, targets: object) -> LintResponse:
                     {
                         "path": target["path"],
                         "line": node.lineno,
-                        "column": node.col_offset + 1,
+                        "column": _character_column(source_lines[node.lineno - 1], node.col_offset),
                         "rule": RULE,
                         "severity": SEVERITY,
                         "message": MESSAGE,
@@ -134,9 +135,11 @@ def _read_target(root: Path, relative: str) -> str:
     try:
         resolved = target.resolve(strict=True)
         resolved.relative_to(root)
-        mode = target.stat().st_mode
-        if not stat.S_ISREG(mode):
+        target_stat = target.stat()
+        if not stat.S_ISREG(target_stat.st_mode):
             raise TargetError(ErrorCode.POLICY, "lint target is not a regular file")
+        if target_stat.st_size > MAX_FILE_BYTES:
+            raise TargetError(ErrorCode.POLICY, "lint target is oversized")
         data = target.read_bytes()
     except TargetError:
         raise
@@ -155,6 +158,10 @@ def _is_safe_python_path(value: object) -> bool:
         return False
     path = PurePosixPath(value)
     return not path.is_absolute() and ".." not in path.parts and path.as_posix() == value and value.endswith(".py")
+
+
+def _character_column(line: str, byte_offset: int) -> int:
+    return len(line.encode("utf-8")[:byte_offset].decode("utf-8")) + 1
 
 
 def _is_positive_int(value: object) -> bool:

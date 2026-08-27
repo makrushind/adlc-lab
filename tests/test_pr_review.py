@@ -286,27 +286,42 @@ class PullRequestLintTests(unittest.TestCase):
                 },
             )
 
+    def test_reports_unicode_character_column_for_direct_eval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root, "unicode.py", "é = 1; eval(value)\n")
+            result = lint_pr(root, [{"path": "unicode.py", "added_lines": [1]}])
+            self.assertEqual(result["diagnostics"][0]["column"], 8)
+
     def test_rejects_unsafe_missing_symlink_oversized_and_invalid_python_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            outside = root.parent / "outside.py"
+            corpus = root / "corpus"
+            corpus.mkdir()
+            outside = root / "outside.py"
             outside.write_text("eval(value)\n", encoding="utf-8")
-            self._write(root, "large.py", b"#" * (256 * 1024 + 1))
-            self._write(root, "bad.py", "if True print('missing colon')\n")
-            self._write(root, "non_utf8.py", b"\xff")
-            (root / "link.py").symlink_to(outside)
+            self._write(corpus, "bad.py", "if True print('missing colon')\n")
+            self._write(corpus, "non_utf8.py", b"\xff")
+            (corpus / "link.py").symlink_to(outside)
             for target in (
                 {"path": "/absolute.py", "added_lines": [1]},
                 {"path": "../outside.py", "added_lines": [1]},
                 {"path": "missing.py", "added_lines": [1]},
                 {"path": "link.py", "added_lines": [1]},
-                {"path": "large.py", "added_lines": [1]},
                 {"path": "non_utf8.py", "added_lines": [1]},
                 {"path": "bad.py", "added_lines": [1]},
             ):
                 with self.subTest(target=target), self.assertRaises(TargetError) as raised:
-                    lint_pr(root, [target])
+                    lint_pr(corpus, [target])
                 self.assertIn(raised.exception.code, {ErrorCode.POLICY, ErrorCode.MCP})
+
+    def test_rejects_an_oversized_target_before_reading_its_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = self._write(root, "large.py", b"#" * (256 * 1024 + 1))
+            with mock.patch.object(Path, "read_bytes", return_value=b""):
+                with self.assertRaises(TargetError):
+                    lint_pr(root, [{"path": target.name, "added_lines": [1]}])
 
     def test_validates_strict_response_shape(self) -> None:
         valid = {
