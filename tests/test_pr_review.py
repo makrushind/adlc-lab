@@ -1141,6 +1141,7 @@ class PullRequestReviewLoopTests(unittest.TestCase):
         self.assertIn('"status":"added"', first)
         self.assertIn('"status":"renamed"', first)
         self.assertIn('"status":"deleted"', first)
+        self.assertIn('"status":"modified"', first)
         self.assertIn('"old_path":"old.md"', first)
         self.assertIn('"new_path":"renamed.md"', first)
         self.assertIn("@@ -5 +5 @@ context", first)
@@ -1189,14 +1190,62 @@ class PullRequestReviewLoopTests(unittest.TestCase):
         self.assertGreater(expected_omitted_bytes, 0)
 
     def test_digest_marks_dev_null_added_file_without_new_file_mode_as_added(self) -> None:
+        for old_header in ("--- /dev/null", '--- "/dev/null"'):
+            with self.subTest(old_header=old_header):
+                document = (
+                    "diff --git a/plain.md b/plain.md\n"
+                    f"{old_header}\n"
+                    "+++ b/plain.md\n"
+                    "@@ -0,0 +1,12000 @@\n"
+                    + "+x\n" * 12_000
+                )
+                self.assertIn('"status":"added","path":"plain.md"', self._prompt(document))
+
+    def test_digest_omits_an_excerpt_when_hunk_line_metadata_alone_exceeds_its_cap(self) -> None:
+        enormous_start = "9" * 1_100
         document = (
-            "diff --git a/plain.md b/plain.md\n"
+            "diff --git a/huge.md b/huge.md\n"
+            "new file mode 100644\n"
             "--- /dev/null\n"
-            "+++ b/plain.md\n"
-            "@@ -0,0 +1,12000 @@\n"
-            + "+x\n" * 12_000
+            "+++ b/huge.md\n"
+            f"@@ -0,0 +{enormous_start},1 @@\n"
+            "+x\n"
+            + self._added_lines_diff("padding.md", ["x"] * 12_000)
         )
-        self.assertIn('"status":"added","path":"plain.md"', self._prompt(document))
+        prompt = self._prompt(document)
+        excerpt_records = [json.loads(line) for line in prompt.splitlines() if line.startswith('{"path":')]
+        self.assertTrue(excerpt_records)
+        self.assertTrue(all(len(json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 1024 for record in excerpt_records))
+        self.assertNotIn(f'"line":{enormous_start},', prompt)
+        self.assertGreater(int(re.search(r"OMITTED_LINES count=(\d+)", prompt).group(1)), 0)
+        self.assertGreater(int(re.search(r"OMITTED_BYTES count=(\d+)", prompt).group(1)), 0)
+
+    def test_digest_marks_headerless_empty_added_file_as_added_without_reclassifying_other_statuses(self) -> None:
+        document = (
+            "diff --git a/empty.md b/empty.md\n"
+            "new file mode 100644\n"
+            "index 0000000..e69de29\n"
+            "diff --git a/modified.md b/modified.md\n"
+            "--- a/modified.md\n"
+            "+++ b/modified.md\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+            "diff --git a/deleted.md b/deleted.md\n"
+            "--- a/deleted.md\n"
+            "+++ /dev/null\n"
+            "@@ -1 +0,0 @@\n"
+            "-old\n"
+            "diff --git a/old.md b/renamed.md\n"
+            "similarity index 100%\n"
+            "rename from old.md\n"
+            "rename to renamed.md\n"
+            + self._added_lines_diff("padding.md", ["x"] * 12_000)
+        )
+        prompt = self._prompt(document)
+        for status, path in (("added", "empty.md"), ("modified", "modified.md"), ("deleted", "deleted.md"), ("renamed", "renamed.md")):
+            with self.subTest(status=status):
+                self.assertIn(f'"status":"{status}","path":"{path}"', prompt)
 
     def test_large_digest_escapes_closing_review_boundary_in_untrusted_data(self) -> None:
         closing = "</REVIEW_DIFF>"

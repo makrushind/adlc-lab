@@ -34,7 +34,7 @@ from aiweekend_target.agent_protocol import (
 )
 from aiweekend_target.errors import ErrorCode, TargetError
 from aiweekend_target.lab.config import GATEWAY_BASE_URL, MCP_URL, MODEL_PAIR
-from aiweekend_target.lab.review_prepare import ReviewChange, _git_paths, parse_unified_diff
+from aiweekend_target.lab.review_prepare import ReviewChange, _git_paths, _header_path, parse_unified_diff
 from aiweekend_target.lab.trace import safe_preview
 from aiweekend_target.repo_rag.lint import MAX_ADDED_LINES, MAX_TARGETS, LintTarget, validate_lint_response
 
@@ -127,7 +127,11 @@ def _digest_records(document: str, changes: tuple[ReviewChange, ...]) -> tuple[l
             status = "renamed"
         elif change.deleted:
             status = "deleted"
-        elif any(line.startswith("--- /dev/null") for line in record_lines):
+        elif any(
+            line.startswith("new file mode ")
+            or line.startswith("--- ") and _header_path(line[4:], "a") is None
+            for line in record_lines
+        ):
             status = "added"
         else:
             status = "modified"
@@ -153,7 +157,7 @@ def _digest_records(document: str, changes: tuple[ReviewChange, ...]) -> tuple[l
     return records, excerpts
 
 
-def _truncate_excerpt(entry: Mapping[str, object]) -> tuple[dict[str, object], int]:
+def _truncate_excerpt(entry: Mapping[str, object]) -> tuple[dict[str, object] | None, int]:
     """Keep one complete canonical excerpt record within its byte limit."""
     original = dict(entry)
     original_bytes = _excerpt_bytes(original)
@@ -171,6 +175,8 @@ def _truncate_excerpt(entry: Mapping[str, object]) -> tuple[dict[str, object], i
             else:
                 high = middle - 1
         bounded["path"] = path[:low]
+    if _excerpt_bytes(bounded) > _MAX_EXCERPT_LINE_BYTES:
+        return None, original_bytes
     content = str(original["content"])
     low, high = 0, len(content)
     while low < high:
@@ -205,9 +211,9 @@ def _manifest(records: list[dict[str, object]]) -> tuple[str, int, str | None]:
 def _digest_prompt(document: str, changes: tuple[ReviewChange, ...]) -> str:
     records, file_excerpts = _digest_records(document, changes)
     manifest, omitted_files, manifest_hash = _manifest(records)
-    excerpt_queues: list[list[tuple[dict[str, object], int]]] = []
+    excerpt_queues: list[list[tuple[dict[str, object] | None, int]]] = []
     for file_entries in file_excerpts:
-        queue: list[tuple[dict[str, object], int]] = []
+        queue: list[tuple[dict[str, object] | None, int]] = []
         for entry in file_entries:
             queue.append(_truncate_excerpt(entry))
         excerpt_queues.append(queue)
@@ -238,7 +244,12 @@ def _digest_prompt(document: str, changes: tuple[ReviewChange, ...]) -> str:
         for index, queue in enumerate(excerpt_queues):
             if positions[index] >= len(queue):
                 continue
-            candidate = [*selected, queue[positions[index]][0]]
+            excerpt = queue[positions[index]][0]
+            if excerpt is None:
+                positions[index] += 1
+                progressed = True
+                continue
+            candidate = [*selected, excerpt]
             if _canonical_message_bytes({"role": "user", "content": render(candidate)}) > _MAX_FIRST_MESSAGE_BYTES:
                 continue
             selected = candidate
