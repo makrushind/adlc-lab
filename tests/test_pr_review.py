@@ -2,7 +2,9 @@ import io
 import json
 import tempfile
 import unittest
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import anyio
@@ -392,3 +394,237 @@ class PullRequestLintTests(unittest.TestCase):
             self.assertEqual(anyio.run(health_check, database, marker, scenarios), {"status": "ready"})
             with mock.patch.dict("os.environ", {"ADLC_PR_REVIEW_MODE": "1"}, clear=False):
                 self.assertEqual(anyio.run(health_check, database, marker, scenarios), {"status": "ready"})
+
+
+class _ReviewResponse:
+    def __init__(self, body: object, status_code: int = 200) -> None:
+        self.text = json.dumps(body)
+        self.status_code = status_code
+
+
+class _ReviewSession:
+    def __init__(
+        self,
+        order: list[str],
+        search: object,
+        lint: object,
+        *,
+        tools: tuple[str, ...] = ("search_repo", "lint_pr"),
+    ) -> None:
+        self.order = order
+        self.search = search
+        self.lint = lint
+        self.tools = tools
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def initialize(self) -> None:
+        return None
+
+    async def list_tools(self) -> object:
+        return SimpleNamespace(
+            result_type="complete",
+            next_cursor=None,
+            tools=[SimpleNamespace(name=name) for name in self.tools],
+        )
+
+    async def call_tool(self, name: str, arguments: dict[str, object]) -> object:
+        self.order.append(name)
+        self.calls.append((name, arguments))
+        value = self.search if name == "search_repo" else self.lint
+        return SimpleNamespace(result_type="complete", is_error=False, structured_content=value)
+
+
+class PullRequestReviewLoopTests(unittest.TestCase):
+    def _review_api(self) -> tuple[object, object]:
+        try:
+            from aiweekend_target.pr_review import ReviewPaths, _run
+        except ModuleNotFoundError:
+            self.fail("the separate pr_review loop is absent")
+        return ReviewPaths, _run
+
+    def _diff(self) -> str:
+        return (
+            "diff --git a/pkg/check.py b/pkg/check.py\n"
+            "--- a/pkg/check.py\n"
+            "+++ b/pkg/check.py\n"
+            "@@ -1 +1,2 @@\n"
+            "-old\n"
+            "+safe = 1\n"
+            "+danger = eval(source)  # hf_diff_secret ADLC_CANARY_RAG_7A91C4\n"
+            "diff --git a/docs/readme.md b/docs/readme.md\n"
+            "--- a/docs/readme.md\n"
+            "+++ b/docs/readme.md\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+documentation\n"
+            "diff --git a/removed.py b/removed.py\n"
+            "--- a/removed.py\n"
+            "+++ /dev/null\n"
+            "@@ -1 +0,0 @@\n"
+            "-old\n"
+        )
+
+    def _exercise(
+        self,
+        *,
+        first: object | None = None,
+        final: object | None = None,
+        search: object | None = None,
+        lint: object | None = None,
+        tools: tuple[str, ...] = ("search_repo", "lint_pr"),
+    ) -> tuple[int, list[dict[str, object]], list[dict[str, object]], _ReviewSession, list[str]]:
+        ReviewPaths, run_review = self._review_api()
+
+        async def exercise() -> tuple[int, list[dict[str, object]], list[dict[str, object]], _ReviewSession, list[str]]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                diff_path = root / "pr.diff"
+                diff_path.write_text(self._diff(), encoding="utf-8")
+                order: list[str] = []
+                llm_requests: list[dict[str, object]] = []
+                first_document = first if first is not None else {
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": "review_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "search_repo",
+                                    "arguments": '{"query":"authorization: leaked","limit":2,"path_glob":"pkg/*.py"}',
+                                },
+                            }],
+                        }
+                    }]
+                }
+                final_document = final if final is not None else {
+                    "choices": [{"message": {"role": "assistant", "content": "Pass it. Bearer model_secret " + "x" * 700, "tool_calls": []}}]
+                }
+                search_document = search if search is not None else {
+                    "results": [{
+                        "path": "pkg/context.py",
+                        "line_start": 1,
+                        "line_end": 1,
+                        "content": "raw_rag_secret ADLC_CANARY_MCP_4DB2E8",
+                    }]
+                }
+                lint_document = lint if lint is not None else {
+                    "diagnostics": [{
+                        "path": "pkg/check.py",
+                        "line": 2,
+                        "column": 10,
+                        "rule": "ADLC001",
+                        "severity": "high",
+                        "message": "Avoid eval() on untrusted input",
+                    }]
+                }
+                session = _ReviewSession(order, search_document, lint_document, tools=tools)
+
+                async def post_llm(_: str, body: dict[str, object]) -> _ReviewResponse:
+                    llm_requests.append(body)
+                    order.append(f"LLM{len(llm_requests)}")
+                    return _ReviewResponse(first_document if len(llm_requests) == 1 else final_document)
+
+                @asynccontextmanager
+                async def open_mcp(_: str):
+                    yield session
+
+                output = io.StringIO()
+                status = await run_review(
+                    ReviewPaths(diff=diff_path),
+                    output,
+                    post_llm=post_llm,
+                    open_mcp=open_mcp,
+                )
+                return status, llm_requests, [json.loads(line) for line in output.getvalue().splitlines()], session, order
+
+        return anyio.run(exercise)
+
+    def test_runs_fixed_two_turn_review_and_preserves_deterministic_block_diagnostics(self) -> None:
+        status, requests, events, session, order = self._exercise()
+        expected_diagnostic = {
+            "path": "pkg/check.py",
+            "line": 2,
+            "column": 10,
+            "rule": "ADLC001",
+            "severity": "high",
+            "message": "Avoid eval() on untrusted input",
+        }
+        self.assertEqual(status, 0)
+        self.assertEqual(order, ["LLM1", "search_repo", "lint_pr", "LLM2"])
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(
+            requests[0]["tool_choice"],
+            {"type": "function", "function": {"name": "search_repo"}},
+        )
+        self.assertEqual(requests[1]["tool_choice"], "none")
+        self.assertEqual(session.calls[0], ("search_repo", {"query": "authorization: leaked", "limit": 2, "path_glob": "pkg/*.py"}))
+        self.assertEqual(session.calls[1], ("lint_pr", {"targets": [{"path": "pkg/check.py", "added_lines": [1, 2]}]}))
+        self.assertIn("raw_rag_secret", json.dumps(requests[1]))
+        self.assertIn("Avoid eval()", json.dumps(requests[1]))
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["llm_request", "llm_response", "mcp_request", "mcp_result", "mcp_request", "mcp_result", "llm_request", "llm_response", "pr_review_result"],
+        )
+        self.assertEqual(len([event for event in events if event["type"] == "llm_request"]), 2)
+        self.assertEqual(len([event for event in events if event["type"] == "mcp_request"]), 2)
+        self.assertEqual(len([event for event in events if event["type"] == "mcp_result"]), 2)
+        self.assertEqual(
+            events[-1],
+            {
+                "schema": 1,
+                "type": "pr_review_result",
+                "ok": True,
+                "verdict": "block",
+                "diagnostics": [expected_diagnostic],
+                "report_preview": events[-2]["report_preview"],
+            },
+        )
+        serialized = "\n".join(json.dumps(event) for event in events)
+        for secret in ("hf_diff_secret", "raw_rag_secret", "model_secret", "ADLC_CANARY"):
+            self.assertNotIn(secret, serialized)
+        self.assertNotIn("authorization: leaked", serialized)
+        self.assertLessEqual(len(events[-1]["report_preview"]), 512)
+
+    def test_empty_validated_diagnostics_pass_regardless_of_model_wording(self) -> None:
+        final = {"choices": [{"message": {"role": "assistant", "content": "BLOCK this change", "tool_calls": []}}]}
+        status, _, events, _, _ = self._exercise(lint={"diagnostics": []}, final=final)
+        self.assertEqual(status, 0)
+        self.assertEqual(events[-1]["verdict"], "pass")
+        self.assertEqual(events[-1]["diagnostics"], [])
+
+    def test_rejects_wrong_review_tool_surface_before_any_mcp_call(self) -> None:
+        status, requests, events, session, order = self._exercise(tools=("search_repo",))
+        self.assertEqual(status, 1)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(session.calls, [])
+        self.assertEqual(order, ["LLM1"])
+        self.assertEqual(events[-1], {"schema": 1, "type": "pr_review_error", "ok": False, "code": "MCP", "stage": "mcp"})
+
+    def test_malformed_peer_responses_stop_without_retries_or_fallbacks(self) -> None:
+        cases = (
+            ("first", {}, None, None, 1, []),
+            ("search", None, {"results": [{"path": "/bad.py", "line_start": 1, "line_end": 1, "content": "x"}]}, None, 1, ["search_repo"]),
+            ("lint", None, None, {"diagnostics": [{"path": "bad.py"}]}, 1, ["search_repo", "lint_pr"]),
+            ("final", None, None, None, 2, ["search_repo", "lint_pr"]),
+        )
+        for name, first, search, lint, llm_count, mcp_names in cases:
+            with self.subTest(name=name):
+                final = {"choices": []} if name == "final" else None
+                status, requests, events, session, _ = self._exercise(first=first, search=search, lint=lint, final=final)
+                self.assertEqual(status, 1)
+                self.assertEqual(len(requests), llm_count)
+                self.assertEqual([call[0] for call in session.calls], mcp_names)
+                self.assertEqual(events[-1]["type"], "pr_review_error")
+                self.assertNotIn("choices", json.dumps(events))
+
+    def test_default_path_and_cli_dispatch_are_separate_from_agent(self) -> None:
+        ReviewPaths, _ = self._review_api()
+        self.assertEqual(ReviewPaths().diff, Path("/target/workspace/pr.diff"))
+        from aiweekend_target import __main__
+
+        output = io.StringIO()
+        with mock.patch.object(__main__, "run_pr_review", return_value=0) as run:
+            self.assertEqual(__main__.main(["pr-review"], output=output), 0)
+        run.assert_called_once_with(output=output)

@@ -18,6 +18,7 @@ from aiweekend_target.gateway import create_app
 from aiweekend_target.lab.scenarios import LabPaths, load_scenario, reset_scenario, validate_scenarios
 from aiweekend_target.lab.review_prepare import prepare_review
 from aiweekend_target.lab.token import manage_hf_token
+from aiweekend_target.pr_review import run_pr_review
 from aiweekend_target.repo_rag.server import health_http, serve
 
 
@@ -49,6 +50,10 @@ def _reset() -> dict[str, object]:
 
 def _agent() -> int:
     return run_agent()
+
+
+def _pr_review(output: IO[str]) -> int:
+    return run_pr_review(output=output)
 
 
 def _repo_rag() -> None:
@@ -115,6 +120,8 @@ def main(argv: list[str] | None = None, *, output: IO[str] = sys.stdout) -> int:
             return 0
         if arguments == ["agent"]:
             return _agent()
+        if arguments == ["pr-review"]:
+            return _pr_review(output)
         if arguments == ["repo-rag"]:
             _repo_rag()
             return 0
