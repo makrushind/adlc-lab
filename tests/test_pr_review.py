@@ -891,7 +891,16 @@ class PullRequestReviewLoopTests(unittest.TestCase):
             requests[0]["tool_choice"],
             {"type": "function", "function": {"name": "search_repo"}},
         )
-        self.assertEqual(requests[1]["tool_choice"], "none")
+        self.assertIn("parallel_tool_calls", requests[0])
+        self.assertEqual(requests[0]["parallel_tool_calls"], False)
+        self.assertEqual(requests[0]["reasoning_effort"], "low")
+        self.assertEqual(requests[0]["temperature"], 0)
+        self.assertEqual(requests[0]["max_completion_tokens"], 256)
+        self.assertEqual(requests[0]["stream"], False)
+        self.assertEqual(requests[1]["max_completion_tokens"], 1024)
+        self.assertEqual(requests[1]["stream"], False)
+        self.assertNotIn("tools", requests[1])
+        self.assertNotIn("tool_choice", requests[1])
         self.assertEqual(session.calls[0], ("search_repo", {"query": "authorization: leaked", "limit": 2, "path_glob": "pkg/*.py"}))
         self.assertEqual(session.calls[1], ("lint_pr", {"targets": [{"path": "pkg/check.py", "added_lines": [1, 2]}]}))
         self.assertIn("raw_rag_secret", json.dumps(requests[1]))

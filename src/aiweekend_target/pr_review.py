@@ -178,6 +178,10 @@ async def _run(
             "messages": [{"role": "user", "content": prompt}],
             "tools": [_TOOL_SCHEMA],
             "tool_choice": _NAMED_TOOL_CHOICE,
+            "parallel_tool_calls": False,
+            "reasoning_effort": "low",
+            "temperature": 0,
+            "max_completion_tokens": 256,
             "stream": False,
         }
         _write_json(output, _event("llm_request", turn=1, model=MODEL_PAIR, tool="search_repo", status="sent"))
@@ -279,8 +283,7 @@ async def _run(
                             ),
                         },
                     ],
-                    "tools": [_TOOL_SCHEMA],
-                    "tool_choice": "none",
+                    "max_completion_tokens": 1024,
                     "stream": False,
                 }
                 _write_json(output, _event("llm_request", turn=2, model=MODEL_PAIR, tool="none", status="sent"))
