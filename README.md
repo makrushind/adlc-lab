@@ -99,9 +99,9 @@ PASS означает: команда `agent` завершилась с кодо
 целевой ветки (контейнеры не запускают Git):
 
 ```bash
-git diff --no-ext-diff --unified=0 origin/main...HEAD -- > pr.diff
-export PR_REVIEW_REPO="$PWD"
-export PR_REVIEW_DIFF="$PWD/pr.diff"
+git -C /absolute/path/to/repo diff --no-ext-diff --unified=3 origin/main...HEAD > /tmp/pr-review.diff
+export PR_REVIEW_REPO="/absolute/path/to/repo"
+export PR_REVIEW_DIFF="/tmp/pr-review.diff"
 ```
 
 `PR_REVIEW_REPO` и `PR_REVIEW_DIFF` должны быть абсолютными путями к checkout
@@ -109,7 +109,7 @@ export PR_REVIEW_DIFF="$PWD/pr.diff"
 
 ```bash
 docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml run --rm reset prepare-review
-docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml up -d --wait repo-rag
+docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml up -d --wait repo-rag hf-gateway
 docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml run --rm agent pr-review
 ```
 
@@ -127,10 +127,17 @@ docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml run --rm agen
 диагностику; текст модели не может изменить этот результат. Успешный PR review
 делает ровно два billable live-вызова модели через Hugging Face gateway.
 
-Это Python MVP, а не универсальный анализатор: в снимок входят только
-разрешённые текстовые типы файлов, а lint проверяет только прямой вызов
-`eval(...)` в добавленных строках изменённых `.py`-файлов. Код checkout не
-исполняется, а diff и снимок ограничены политиками размера и состава.
+Это Python MVP, а не универсальный анализатор. Его точные границы:
+
+- В снимок входят только `.py`, `.pyi`, `.md`, `.toml`, `.yaml`, `.yml`,
+  `.json` и `.txt`; diff должен быть не больше 512 KiB.
+- Подготовка копирует не более 1 000 файлов, до 256 KiB на файл и до 10 MiB
+  суммарно.
+- Lint принимает не более 100 изменённых Python targets, не более 10 000
+  добавленных строк суммарно, до 256 KiB на target и возвращает не более 100
+  diagnostics.
+- Lint проверяет только прямой вызов `eval(...)` в добавленных строках
+  изменённых `.py`-файлов; код checkout не исполняется.
 
 Внимание о приватности: полный diff и найденные RAG-фрагменты отправляются
 через Hugging Face gateway внешнему провайдеру модели. Redaction trace скрывает
