@@ -1,0 +1,19 @@
+services:
+  reset:
+    volumes:
+      - type: bind
+        source: ${PR_REVIEW_REPO:?PR_REVIEW_REPO must be an absolute checkout path}
+        target: /input/repo
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PR_REVIEW_DIFF:?PR_REVIEW_DIFF must be an absolute unified diff path}
+        target: /input/pr.diff
+        read_only: true
+        bind:
+          create_host_path: false
+
+  repo-rag:
+    environment:
+      ADLC_PR_REVIEW_MODE: "1"

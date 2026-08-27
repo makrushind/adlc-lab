@@ -16,12 +16,35 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
+      - name: Create temporary PR review input
+        run: |
+          review_root="$(mktemp -d)"
+          case "$review_root" in
+            /*) ;;
+            *) exit 1 ;;
+          esac
+          mkdir -p "$review_root/repo"
+          printf 'value = 1\n' > "$review_root/repo/review.py"
+          printf '%s\n' \
+            'diff --git a/review.py b/review.py' \
+            'new file mode 100644' \
+            'index 0000000..1234567' \
+            '--- /dev/null' \
+            '+++ b/review.py' \
+            '@@ -0,0 +1 @@' \
+            '+value = 1' > "$review_root/pr.diff"
+          {
+            printf 'PR_REVIEW_REPO=%s\n' "$review_root/repo"
+            printf 'PR_REVIEW_DIFF=%s\n' "$review_root/pr.diff"
+          } >> "$GITHUB_ENV"
+
       - name: Validate base and scenario Compose models
         run: |
           docker compose config --quiet
           for overlay in baseline rag-poisoning mcp-poisoning llm-injection custom; do
             docker compose -f compose.yaml -f "scenarios/${overlay}.compose.yaml" config --quiet
           done
+          docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml config --quiet
 
       - name: Build the three native images once
         run: docker compose build
@@ -32,19 +55,27 @@ jobs:
       - name: Validate all fixed scenario fixtures
         run: docker compose run --rm --no-deps -T reset validate-scenarios
 
+      - name: Prepare review snapshot and health-check repo-rag
+        run: |
+          docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml run --rm --no-deps -T reset prepare-review
+          docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml up -d --wait repo-rag
+
       - name: Assert the resolved isolation model
         run: |
           docker compose --profile tools config --format json --no-path-resolution > /tmp/adlc-base.json
           for overlay in baseline rag-poisoning mcp-poisoning llm-injection custom; do
             docker compose --profile tools -f compose.yaml -f "scenarios/${overlay}.compose.yaml" config --format json --no-path-resolution > "/tmp/adlc-${overlay}.json"
           done
+          docker compose --profile tools -f compose.yaml -f scenarios/pr-review.compose.yaml config --format json --no-path-resolution > /tmp/adlc-pr-review.json
           python3 - <<'PY'
           import copy
           import json
+          import os
           from pathlib import Path
 
           base = json.loads(Path("/tmp/adlc-base.json").read_text(encoding="utf-8"))
           custom = json.loads(Path("/tmp/adlc-custom.json").read_text(encoding="utf-8"))
+          pr_review = json.loads(Path("/tmp/adlc-pr-review.json").read_text(encoding="utf-8"))
           expected_scenarios = ("baseline", "rag-poisoning", "mcp-poisoning", "llm-injection", "custom")
           resolved_scenarios = {
               scenario: json.loads(Path(f"/tmp/adlc-{scenario}.json").read_text(encoding="utf-8"))
@@ -131,6 +162,33 @@ jobs:
               or not custom_binds[0].get("read_only")
           ):
               raise SystemExit("custom payload bind mismatch")
+
+          expected_review_binds = {
+              (os.environ["PR_REVIEW_REPO"], "/input/repo"),
+              (os.environ["PR_REVIEW_DIFF"], "/input/pr.diff"),
+          }
+          review_binds = [
+              mount
+              for mount in pr_review["services"]["reset"].get("volumes", [])
+              if mount.get("type") == "bind"
+          ]
+          if (
+              len(review_binds) != 2
+              or {(mount.get("source"), mount.get("target")) for mount in review_binds} != expected_review_binds
+              or any(not mount.get("read_only") for mount in review_binds)
+          ):
+              raise SystemExit("PR review input bind mismatch")
+          if pr_review["services"]["repo-rag"].get("environment") != {"ADLC_PR_REVIEW_MODE": "1"}:
+              raise SystemExit("PR review mode environment mismatch")
+          normalized_review = copy.deepcopy(pr_review)
+          normalized_review["services"]["reset"]["volumes"] = [
+              mount
+              for mount in normalized_review["services"]["reset"].get("volumes", [])
+              if mount.get("type") != "bind"
+          ]
+          normalized_review["services"]["repo-rag"].pop("environment", None)
+          if normalized_review != base:
+              raise SystemExit("PR review overlay changes more than its two inputs and mode flag")
 
           root = Path(".")
           retired = "open" + "code"

@@ -92,6 +92,56 @@ PASS означает: команда `agent` завершилась с кодо
 выше. Содержимое `text_preview` и формулировка ответа модели для PASS не
 важны.
 
+## Локальный PR review
+
+Этот режим намеренно отделён от учебных фиксированных сценариев. На хосте
+перейдите на PR head и создайте обычный текстовый unified diff относительно
+целевой ветки (контейнеры не запускают Git):
+
+```bash
+git diff --no-ext-diff --unified=0 origin/main...HEAD -- > pr.diff
+export PR_REVIEW_REPO="$PWD"
+export PR_REVIEW_DIFF="$PWD/pr.diff"
+```
+
+`PR_REVIEW_REPO` и `PR_REVIEW_DIFF` должны быть абсолютными путями к checkout
+на PR head и к созданному diff. Затем выполните строго эти три команды:
+
+```bash
+docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml run --rm reset prepare-review
+docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml up -d --wait repo-rag
+docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml run --rm agent pr-review
+```
+
+Первая команда создаёт отфильтрованный снимок checkout, diff и RAG-индекс в
+именованных volumes. Снимок сохраняется после завершения контейнера и
+используется следующими командами; повторный `prepare-review` заменяет его.
+Последняя команда печатает JSONL, а при завершённом протоколе её последняя
+строка имеет вид:
+
+```json
+{"schema":1,"type":"pr_review_result","ok":true,"verdict":"pass","diagnostics":[],"report_preview":"..."}
+```
+
+`verdict` равен `block`, если детерминированный lint нашёл high-severity
+диагностику; текст модели не может изменить этот результат. Успешный PR review
+делает ровно два billable live-вызова модели через Hugging Face gateway.
+
+Это Python MVP, а не универсальный анализатор: в снимок входят только
+разрешённые текстовые типы файлов, а lint проверяет только прямой вызов
+`eval(...)` в добавленных строках изменённых `.py`-файлов. Код checkout не
+исполняется, а diff и снимок ограничены политиками размера и состава.
+
+Внимание о приватности: полный diff и найденные RAG-фрагменты отправляются
+через Hugging Face gateway внешнему провайдеру модели. Redaction trace скрывает
+код только в локальном выводе и не скрывает его от этой модели.
+
+После review удалите снимок, контейнеры, сети и volumes:
+
+```bash
+docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml down -v --remove-orphans
+```
+
 ## Фиксированные учебные атаки
 
 Для каждого запуска используйте три команды из строки таблицы. Override
