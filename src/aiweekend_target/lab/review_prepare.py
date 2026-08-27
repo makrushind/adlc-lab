@@ -7,7 +7,7 @@ import re
 import shutil
 import stat
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from aiweekend_target.errors import ErrorCode, TargetError
@@ -24,6 +24,7 @@ _ALLOWED_SUFFIXES = frozenset({".py", ".pyi", ".md", ".toml", ".yaml", ".yml", "
 _SKIPPED_DIRECTORIES = frozenset({
     ".git", ".venv", "venv", "env", "node_modules", "vendor", "build", "dist", "cache", ".cache",
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
+    ".lab", ".superpowers", ".sdd", ".codex", ".agents",
 })
 _HUNK = re.compile(r"^@@ -(?P<old_start>0|[1-9][0-9]*)(?:,(?P<old_count>[0-9]+))? \+(?P<new_start>0|[1-9][0-9]*)(?:,(?P<new_count>[0-9]+))? @@(?: .*)?$")
 _INDEX = re.compile(r"^index (?P<old>[0-9a-f]{4,64})\.\.(?P<new>[0-9a-f]{4,64})(?: (?P<mode>[0-7]{6}))?$")
@@ -41,6 +42,7 @@ class ReviewChange:
     path: str
     added_lines: tuple[int, ...]
     deleted: bool
+    new_hunks: tuple[tuple[int, tuple[str, ...]], ...] = field(default=(), compare=False, repr=False)
 
 
 def parse_unified_diff(document: str) -> tuple[ReviewChange, ...]:
@@ -241,6 +243,7 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
         raise _policy("diff has contradictory metadata")
 
     added: list[int] = []
+    new_hunks: list[tuple[int, tuple[str, ...]]] = []
     saw_hunk = False
     saw_content_change = False
     while position < len(record):
@@ -255,11 +258,13 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
         position += 1
         old_seen = 0
         new_seen = 0
+        new_side: list[str] = []
         previous_was_content = False
         while position < len(record) and not record[position].startswith("@@ "):
             body = record[position]
             if body.startswith("+"):
                 new_seen += 1
+                new_side.append(body[1:])
                 added.append(new_start + new_seen - 1)
                 previous_was_content = True
                 saw_content_change = True
@@ -270,6 +275,7 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
             elif body.startswith(" "):
                 old_seen += 1
                 new_seen += 1
+                new_side.append(body[1:])
                 previous_was_content = True
             elif body == "\\ No newline at end of file" and previous_was_content:
                 previous_was_content = False
@@ -278,13 +284,14 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
             position += 1
         if old_seen != old_count or new_seen != new_count:
             raise _policy("diff hunk line counts do not match header")
+        new_hunks.append((new_start, tuple(new_side)))
         saw_hunk = True
     if not saw_hunk or not saw_content_change:
         raise _policy("diff has no changes")
     target = old_header if deleted else new_header
     if target is None:
         raise _policy("diff has malformed file headers")
-    return ReviewChange(target, tuple(sorted(set(added))), deleted)
+    return ReviewChange(target, tuple(sorted(set(added))), deleted, tuple(new_hunks))
 
 
 def _record_mode(current: str | None, value: str) -> str:
@@ -533,11 +540,11 @@ def _validate_changed_targets(
     except OSError as error:
         raise _policy("source checkout is unavailable") from error
     for change in changes:
+        relative = PurePosixPath(change.path)
+        if any(part in _SKIPPED_DIRECTORIES for part in relative.parts[:-1]):
+            raise _policy("changed target is excluded from the review corpus")
         if change.deleted:
             continue
-        relative = PurePosixPath(change.path)
-        if change.path.endswith(".py") and any(part in _SKIPPED_DIRECTORIES for part in relative.parts[:-1]):
-            raise _policy("changed Python target is excluded from the review corpus")
         if change.path.endswith(".py") and change.path not in files:
             raise _policy("changed Python target is excluded from the review corpus")
         target = root.joinpath(*relative.parts)
@@ -553,6 +560,28 @@ def _validate_changed_targets(
             raise _policy("changed target is unavailable") from error
         if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
             raise _policy("changed target is not a regular file")
+        if change.new_hunks:
+            data = files.get(change.path)
+            if data is None:
+                data = _read_regular(
+                    target,
+                    "changed target",
+                    _MAX_FILE_BYTES,
+                    containment_root=resolved_root,
+                    root_identity=_directory_identity(resolved_root.lstat()),
+                )
+            try:
+                checkout_lines = data.decode("utf-8").splitlines()
+            except UnicodeDecodeError as error:
+                raise _policy("changed target is not UTF-8") from error
+            for new_start, expected_lines in change.new_hunks:
+                if not expected_lines:
+                    if not 0 <= new_start <= len(checkout_lines):
+                        raise _policy("diff does not match the source checkout")
+                    continue
+                start = new_start - 1
+                if tuple(checkout_lines[start : start + len(expected_lines)]) != expected_lines:
+                    raise _policy("diff does not match the source checkout")
 
 
 def _read_regular(
@@ -694,8 +723,13 @@ def _paths_overlap(left: Path, right: Path) -> bool:
 
 
 def _reject_credential(relative: str) -> None:
-    name = PurePosixPath(relative).name
-    if name == ".env" or name.endswith(".pem") or name.endswith(".key"):
+    name = PurePosixPath(relative).name.casefold()
+    if (
+        name == ".env"
+        or name.startswith(".env.")
+        or name.endswith((".pem", ".key"))
+        or name in {"credentials.json", "secrets.txt", "id_rsa"}
+    ):
         raise _policy("review input contains a credential path")
 
 

@@ -20,18 +20,18 @@ class GatewayErrorTests(unittest.TestCase):
     def test_rate_limited_upstream_response_is_quota_failure(self) -> None:
         self.assertEqual(_upstream_error(429).code, ErrorCode.QUOTA)
 
-    def test_probe_consumes_an_upstream_failure_before_its_client_closes(self) -> None:
+    def test_probe_handles_an_unknown_length_upstream_failure_without_reading_its_body(self) -> None:
         class ClosingTransport(httpx.AsyncBaseTransport):
             def __init__(self) -> None:
                 self.closed = False
+                self.iterated = False
 
             async def handle_async_request(self, _: httpx.Request) -> httpx.Response:
                 transport = self
 
                 class ResponseStream(httpx.AsyncByteStream):
                     async def __aiter__(self):
-                        if transport.closed:
-                            raise httpx.ReadError("client closed before response read")
+                        transport.iterated = True
                         yield b'{}'
 
                     async def aclose(self) -> None:
@@ -42,9 +42,11 @@ class GatewayErrorTests(unittest.TestCase):
             async def aclose(self) -> None:
                 self.closed = True
 
+        transport = ClosingTransport()
         with self.assertRaises(TargetError) as captured:
-            asyncio.run(probe_available("secret", ClosingTransport()))
+            asyncio.run(probe_available("secret", transport))
         self.assertEqual(captured.exception.code, ErrorCode.PROVIDER)
+        self.assertFalse(transport.iterated)
 
     def test_declared_oversized_error_body_is_not_requested_from_the_source(self) -> None:
         delivered: list[int] = []
@@ -77,30 +79,36 @@ class GatewayErrorTests(unittest.TestCase):
             "truncated": True,
         })
 
-    def test_error_diagnostics_do_not_fetch_after_an_exact_unknown_cap(self) -> None:
-        delivered: list[int] = []
+    def test_unknown_or_invalid_declared_error_body_lengths_are_never_read(self) -> None:
+        for name, headers in (
+            ("missing", {}),
+            ("invalid", {"content-length": "not-a-number"}),
+            ("signed", {"content-length": "+1"}),
+            ("negative", {"content-length": "-1"}),
+        ):
+            with self.subTest(name=name):
+                delivered: list[int] = []
 
-        class ResponseStream(httpx.AsyncByteStream):
-            async def __aiter__(self):
-                delivered.append(16 * 1024)
-                yield b"x" * (16 * 1024)
-                delivered.append(1)
-                yield b"y"
+                class ResponseStream(httpx.AsyncByteStream):
+                    async def __aiter__(self):
+                        delivered.append(1)
+                        yield b"x"
 
-            async def aclose(self) -> None:
-                return None
+                    async def aclose(self) -> None:
+                        return None
 
-        async def exercise() -> dict[str, object]:
-            response = httpx.Response(400, stream=ResponseStream())
-            try:
-                return await _bounded_error_diagnostics(response)
-            finally:
-                await response.aclose()
+                async def exercise() -> dict[str, object]:
+                    response = httpx.Response(400, headers=headers, stream=ResponseStream())
+                    try:
+                        return await _bounded_error_diagnostics(response)
+                    finally:
+                        await response.aclose()
 
-        diagnostics = asyncio.run(exercise())
-        self.assertEqual(delivered, [16 * 1024])
-        self.assertEqual(diagnostics["sample_bytes"], 16 * 1024)
-        self.assertEqual(diagnostics["truncated"], False)
+                diagnostics = asyncio.run(exercise())
+                self.assertEqual(delivered, [])
+                self.assertEqual(diagnostics["sample_bytes"], 0)
+                self.assertEqual(diagnostics["sample_sha256"], hashlib.sha256(b"").hexdigest())
+                self.assertTrue(diagnostics["truncated"])
 
     def test_error_diagnostics_expose_an_oversized_source_chunk_without_retaining_it(self) -> None:
         delivered: list[int] = []
@@ -114,7 +122,7 @@ class GatewayErrorTests(unittest.TestCase):
                 return None
 
         async def exercise() -> dict[str, object]:
-            response = httpx.Response(400, stream=ResponseStream())
+            response = httpx.Response(400, headers={"content-length": str(16 * 1024)}, stream=ResponseStream())
             try:
                 return await _bounded_error_diagnostics(response)
             finally:
@@ -220,7 +228,7 @@ class GatewayChatAsgiTests(unittest.TestCase):
                 return None
 
         def handler(_: httpx.Request) -> httpx.Response:
-            return httpx.Response(400, stream=FailingResponseStream())
+            return httpx.Response(400, headers={"content-length": "2"}, stream=FailingResponseStream())
 
         async def exercise() -> httpx.Response:
             app = create_app(transport=httpx.MockTransport(handler))
@@ -239,6 +247,7 @@ class GatewayChatAsgiTests(unittest.TestCase):
     def test_chat_upstream_failures_log_only_bounded_redacted_transport_metadata(self) -> None:
         canary = "CANARY_HF_GATEWAY_TRANSPORT_MUST_NOT_APPEAR"
         credential = "hf_transport_credential_must_not_appear"
+        short_provider_values = ("ADLC_CANARY_RAG_7A91C4", "hf_shortcredential", "token1234567890")
         secret = "hf_gateway_secret_must_not_appear"
         bodies = [
             (
@@ -297,6 +306,21 @@ class GatewayChatAsgiTests(unittest.TestCase):
                 None,
                 False,
                 False,
+            ),
+            *(
+                (
+                    f"short unsafe error fields {value}",
+                    json.dumps(
+                        {"error": {"type": value, "code": value, "param": value}},
+                        separators=(",", ":"),
+                    ).encode("utf-8"),
+                    None,
+                    None,
+                    None,
+                    False,
+                    False,
+                )
+                for value in short_provider_values
             ),
             (
                 "oversized body",
@@ -420,5 +444,5 @@ class GatewayChatAsgiTests(unittest.TestCase):
                 "truncated": truncated,
             })
         rendered_logs = json.dumps(logs, separators=(",", ":"))
-        for forbidden in (canary, credential, secret, "Authorization", "Bearer"):
+        for forbidden in (canary, credential, *short_provider_values, secret, "Authorization", "Bearer"):
             self.assertNotIn(forbidden, rendered_logs)

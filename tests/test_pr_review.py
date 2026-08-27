@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
@@ -11,8 +12,10 @@ from unittest import mock
 
 import anyio
 from aiweekend_target.errors import ErrorCode, TargetError
+from aiweekend_target.agent_protocol import validate_search_response
 from aiweekend_target.lab.review_prepare import ReviewChange, parse_unified_diff, prepare_review
 from aiweekend_target.lab.scenarios import LabPaths
+from aiweekend_target.repo_rag.index import build_index
 from aiweekend_target.repo_rag.lint import lint_pr, validate_lint_response
 from aiweekend_target.repo_rag.search import RepoSearch
 from aiweekend_target.repo_rag.server import create_server, health_check
@@ -31,7 +34,7 @@ class PrepareReviewTests(unittest.TestCase):
     def _prepare(self, root: Path, diff: str) -> tuple[dict[str, object], LabPaths, Path]:
         source = root / "source"
         source.mkdir()
-        self._write(source, "app.py", "old\n")
+        self._write(source, "app.py", "new\n")
         diff_path = root / "pr.diff"
         diff_path.write_text(diff, encoding="utf-8")
         marker = root / "baseline-scenario.json"
@@ -218,48 +221,86 @@ class PrepareReviewTests(unittest.TestCase):
                 self.assertEqual((target / "sentinel.txt").read_text(encoding="utf-8"), target.name)
             self.assertFalse((paths.workspace / "pr.diff").exists())
 
+    def test_control_and_evidence_directories_never_enter_corpus_or_index(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, paths, source = self._prepare(root, self._diff("app.py", "app.py"))
+            for position, skipped in enumerate((".lab", ".superpowers", ".sdd", ".codex", ".agents")):
+                self._write(source, f"{skipped}/evidence-{position}.md", f"privateevidence{position}\n")
+                self._write(source, f"{skipped}/control-{position}.json", f'{{"privatecontrol":{position}}}\n')
+
+            prepare_review(paths, source, root / "pr.diff", root / "baseline-scenario.json")
+
+            for position, skipped in enumerate((".lab", ".superpowers", ".sdd", ".codex", ".agents")):
+                self.assertFalse((paths.corpus / skipped).exists())
+                self.assertEqual(RepoSearch(paths.rag_index / "index.sqlite").search_repo(f"privateevidence{position}"), {"results": []})
+                self.assertEqual(RepoSearch(paths.rag_index / "index.sqlite").search_repo("privatecontrol"), {"results": []})
+
+    def test_rejects_changed_control_or_evidence_target_before_mutation(self) -> None:
+        for skipped in (".lab", ".superpowers", ".sdd", ".codex", ".agents"):
+            for deleted in (False, True):
+                with self.subTest(skipped=skipped, deleted=deleted), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    source = root / "source"
+                    source.mkdir()
+                    relative = f"{skipped}/evidence.md"
+                    if deleted:
+                        document = (
+                            f"diff --git a/{relative} b/{relative}\n"
+                            f"--- a/{relative}\n"
+                            "+++ /dev/null\n"
+                            "@@ -1 +0,0 @@\n"
+                            "-old\n"
+                        )
+                    else:
+                        self._write(source, relative, "new\n")
+                        document = self._diff(relative, relative)
+                    diff = self._write(root, "pr.diff", document)
+                    marker = self._write(root, "marker.json", "{}")
+                    paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+                    for target in (paths.workspace, paths.corpus, paths.rag_index):
+                        self._write(target, "sentinel.txt", target.name)
+
+                    with self.assertRaises(TargetError) as raised:
+                        prepare_review(paths, source, diff, marker)
+
+                    self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+                    for target in (paths.workspace, paths.corpus, paths.rag_index):
+                        self.assertEqual((target / "sentinel.txt").read_text(encoding="utf-8"), target.name)
+                    self.assertFalse((paths.workspace / "pr.diff").exists())
+
     def test_rejects_credential_paths_from_every_diff_direction(self) -> None:
-        cases = (
-            (
-                "deleted env",
-                "diff --git a/.env b/.env\n"
-                "deleted file mode 100644\n"
-                "--- a/.env\n"
-                "+++ /dev/null\n"
-                "@@ -1 +0,0 @@\n-secret\n",
-            ),
-            (
-                "rename away pem",
-                "diff --git a/secrets/client.pem b/client.py\n"
-                "similarity index 100%\n"
-                "rename from secrets/client.pem\n"
-                "rename to client.py\n",
-            ),
-            (
-                "rename to key",
-                "diff --git a/client.py b/secrets/client.key\n"
-                "similarity index 100%\n"
-                "rename from client.py\n"
-                "rename to secrets/client.key\n",
-            ),
-            (
-                "added env",
-                "diff --git a/config/.env b/config/.env\n"
-                "new file mode 100644\n"
-                "index 0000000..e69de29\n",
-            ),
+        credential_paths = (
+            ".env",
+            "config/.env.production",
+            "certs/client.pem",
+            "keys/client.key",
+            "config/credentials.json",
+            "notes/secrets.txt",
+            "keys/ID_RSA",
+            "certs/CLIENT.PEM",
         )
-        for name, document in cases:
-            with self.subTest(name=name), self.assertRaises(TargetError) as raised:
-                parse_unified_diff(document)
-            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+        for credential_path in credential_paths:
+            for direction in ("old", "new"):
+                old = credential_path if direction == "old" else "safe.py"
+                new = credential_path if direction == "new" else "safe.py"
+                document = (
+                    f"diff --git a/{old} b/{new}\n"
+                    "similarity index 100%\n"
+                    f"rename from {old}\n"
+                    f"rename to {new}\n"
+                )
+                with self.subTest(path=credential_path, direction=direction):
+                    with self.assertRaises(TargetError) as raised:
+                        parse_unified_diff(document)
+                    self.assertEqual(raised.exception.code, ErrorCode.POLICY)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source"
             source.mkdir()
-            self._write(source, "app.py", "value = 1\n")
-            diff = self._write(root, "credential.diff", cases[0][1])
+            self._write(source, "app.py", "new\n")
+            diff = self._write(root, "credential.diff", self._diff(".env", ".env"))
             marker = self._write(root, "marker.json", "{}")
             paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
             self._write(paths.workspace, "sentinel.txt", "unchanged")
@@ -267,6 +308,56 @@ class PrepareReviewTests(unittest.TestCase):
                 prepare_review(paths, source, diff, marker)
             self.assertEqual((paths.workspace / "sentinel.txt").read_text(encoding="utf-8"), "unchanged")
             self.assertFalse((paths.workspace / "pr.diff").exists())
+
+    def test_rejects_every_credential_checkout_candidate_before_mutation(self) -> None:
+        for credential_path in (
+            ".env",
+            "config/.env.production",
+            "certs/client.pem",
+            "keys/client.key",
+            "config/credentials.json",
+            "notes/secrets.txt",
+            "keys/ID_RSA",
+            "certs/CLIENT.PEM",
+        ):
+            with self.subTest(path=credential_path), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source"
+                source.mkdir()
+                self._write(source, "app.py", "new\n")
+                self._write(source, credential_path, "credential\n")
+                diff = self._write(root, "pr.diff", self._diff("app.py", "app.py"))
+                marker = self._write(root, "marker.json", "{}")
+                paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+                for target in (paths.workspace, paths.corpus, paths.rag_index):
+                    self._write(target, "sentinel.txt", target.name)
+
+                with self.assertRaises(TargetError) as raised:
+                    prepare_review(paths, source, diff, marker)
+
+                self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+                for target in (paths.workspace, paths.corpus, paths.rag_index):
+                    self.assertEqual((target / "sentinel.txt").read_text(encoding="utf-8"), target.name)
+
+    def test_allows_ordinary_source_basenames_that_only_resemble_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, paths, source = self._prepare(root, self._diff("app.py", "app.py"))
+            allowed = (
+                "credentials.py",
+                "secrets_notes.txt",
+                "client.pem.py",
+                "secrets.txt.py",
+                "id_rsa.py",
+                ".environment.txt",
+            )
+            for relative in allowed:
+                self._write(source, relative, "allowed\n")
+
+            prepare_review(paths, source, root / "pr.diff", root / "baseline-scenario.json")
+
+            for relative in allowed:
+                self.assertEqual((paths.corpus / relative).read_text(encoding="utf-8"), "allowed\n")
 
     def test_rejects_added_and_deleted_hunks_with_opposite_side_content(self) -> None:
         contradictory_deleted = (
@@ -287,6 +378,102 @@ class PrepareReviewTests(unittest.TestCase):
                 parse_unified_diff(document)
             self.assertEqual(raised.exception.code, ErrorCode.POLICY)
 
+    def test_rejects_diff_new_side_incoherent_with_checkout_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            self._write(source, "app.py", "safe = 1\n# spacer\nvalue = eval(source)\n")
+            diff = self._write(
+                root,
+                "pr.diff",
+                "diff --git a/app.py b/app.py\n"
+                "--- a/app.py\n"
+                "+++ b/app.py\n"
+                "@@ -1 +1,2 @@\n"
+                " safe = 1\n"
+                "+value = eval(source)\n",
+            )
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+            for target in (paths.workspace, paths.corpus, paths.rag_index):
+                self._write(target, "sentinel.txt", target.name)
+
+            with self.assertRaises(TargetError) as raised:
+                prepare_review(paths, source, diff, marker)
+
+            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+            for target in (paths.workspace, paths.corpus, paths.rag_index):
+                self.assertEqual((target / "sentinel.txt").read_text(encoding="utf-8"), target.name)
+            self.assertFalse((paths.workspace / "pr.diff").exists())
+
+    def test_rejects_empty_new_side_hunk_outside_checkout_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            self._write(source, "app.py", "remaining\n")
+            diff = self._write(
+                root,
+                "pr.diff",
+                "diff --git a/app.py b/app.py\n"
+                "--- a/app.py\n"
+                "+++ b/app.py\n"
+                "@@ -100 +99,0 @@\n"
+                "-removed\n",
+            )
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+
+            with self.assertRaises(TargetError) as raised:
+                prepare_review(paths, source, diff, marker)
+
+            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+
+    def test_accepts_checkout_coherent_added_modified_renamed_metadata_and_deleted_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            self._write(source, "added.py", "one\ntwo\n")
+            self._write(source, "new.py", "new\n")
+            self._write(source, "script.py", "print('ok')\n")
+            document = (
+                "diff --git a/added.py b/added.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/added.py\n"
+                "@@ -0,0 +1,2 @@\n"
+                "+one\n"
+                "+two\n"
+                "diff --git a/old.py b/new.py\n"
+                "similarity index 50%\n"
+                "rename from old.py\n"
+                "rename to new.py\n"
+                "--- a/old.py\n"
+                "+++ b/new.py\n"
+                "@@ -1 +1 @@\n"
+                "-old\n"
+                "+new\n"
+                "diff --git a/script.py b/script.py\n"
+                "old mode 100644\n"
+                "new mode 100755\n"
+                "diff --git a/removed.py b/removed.py\n"
+                "--- a/removed.py\n"
+                "+++ /dev/null\n"
+                "@@ -1 +0,0 @@\n"
+                "-removed\n"
+            )
+            diff = self._write(root, "pr.diff", document)
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+
+            result = prepare_review(paths, source, diff, marker)
+
+            self.assertEqual(result["changed_files"], 4)
+            self.assertEqual((paths.corpus / "added.py").read_text(encoding="utf-8"), "one\ntwo\n")
+            self.assertEqual((paths.corpus / "new.py").read_text(encoding="utf-8"), "new\n")
+
     def test_prepares_only_allowlisted_files_and_leaves_source_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -296,7 +483,7 @@ class PrepareReviewTests(unittest.TestCase):
             self._write(source, "assets/logo.png", b"\x89PNG\r\n")
             result = prepare_review(paths, source, root / "pr.diff", root / "baseline-scenario.json")
             self.assertEqual(result, {"ok": True, "prepared": True, "copied_files": 2, "copied_bytes": 29, "changed_files": 1})
-            self.assertEqual((source / "app.py").read_text(encoding="utf-8"), "old\n")
+            self.assertEqual((source / "app.py").read_text(encoding="utf-8"), "new\n")
             self.assertTrue((paths.corpus / "app.py").is_file())
             self.assertTrue((paths.corpus / "docs/readme.md").is_file())
             self.assertFalse((paths.corpus / "assets/logo.png").exists())
@@ -405,7 +592,7 @@ class PrepareReviewTests(unittest.TestCase):
                 root = Path(directory)
                 source = root / "source"
                 source.mkdir()
-                source_file = self._write(source, "app.py", "old\n")
+                source_file = self._write(source, "app.py", "new\n")
                 diff = self._write(root, "pr.diff", self._diff("app.py", "app.py"))
                 marker = self._write(root, "marker.json", "{}")
                 blocked = {"diff": diff, "file": source_file, "marker": marker}[kind]
@@ -433,7 +620,7 @@ class PrepareReviewTests(unittest.TestCase):
             root = Path(directory)
             source = root / "source"
             source.mkdir()
-            target = self._write(source, "app.py", "old\n")
+            target = self._write(source, "app.py", "new\n")
             original_inode = target.stat().st_ino
             diff = self._write(root, "pr.diff", self._diff("app.py", "app.py"))
             marker = self._write(root, "marker.json", "{}")
@@ -462,7 +649,7 @@ class PrepareReviewTests(unittest.TestCase):
             root = Path(directory)
             source = root / "source"
             source.mkdir()
-            self._write(source, "app.py", "old\n")
+            self._write(source, "app.py", "new\n")
             diff = self._write(root, "pr.diff", self._diff("app.py", "app.py"))
             marker = self._write(root, "marker.json", "{}")
             paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
@@ -486,7 +673,7 @@ class PrepareReviewTests(unittest.TestCase):
                 root = Path(directory)
                 source = root / "source"
                 source.mkdir()
-                self._write(source, "app.py", "old\n")
+                self._write(source, "app.py", "new\n")
                 diff_parent = root / "inputs"
                 diff = self._write(diff_parent, "pr.diff", self._diff("app.py", "app.py"))
                 marker = self._write(root, "marker.json", "{}")
@@ -545,6 +732,59 @@ class PrepareReviewTests(unittest.TestCase):
             with mock.patch.object(__main__, "_WORKSPACE", paths.workspace), mock.patch.object(__main__, "_CORPUS", paths.corpus), mock.patch.object(__main__, "_RAG_INDEX", paths.rag_index), mock.patch.object(__main__, "_PREPARE_SOURCE", root / "source"), mock.patch.object(__main__, "_PREPARE_DIFF", root / "pr.diff"), mock.patch.object(__main__, "_PREPARE_MARKER", root / "baseline-scenario.json"):
                 self.assertEqual(__main__.main(["prepare-review"], output=output), 0)
             self.assertTrue(json.loads(output.getvalue())["prepared"])
+
+
+class RepoRagChunkTests(unittest.TestCase):
+    def test_indexes_and_searches_a_multibyte_nine_kib_single_line_with_protocol_safe_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            corpus = root / "corpus"
+            corpus.mkdir()
+            content = json.dumps(
+                {"payload": "é" * 4_700, "needle": "searchabletail"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            self.assertGreater(len(content.encode("utf-8")), 9 * 1024)
+            (corpus / "large.json").write_text(content + "\n", encoding="utf-8")
+            database = root / "index.sqlite"
+
+            build_index(corpus, database)
+            response = RepoSearch(database).search_repo("searchabletail")
+
+            self.assertEqual(len(response["results"]), 1)
+            self.assertEqual(response["results"][0]["path"], "large.json")
+            self.assertEqual(response["results"][0]["line_start"], 1)
+            self.assertEqual(response["results"][0]["line_end"], 1)
+            self.assertLessEqual(len(response["results"][0]["content"].encode("utf-8")), 8 * 1024)
+            self.assertEqual(validate_search_response(response), response)
+            with sqlite3.connect(database) as connection:
+                chunk_sizes = [len(row[0].encode("utf-8")) for row in connection.execute("SELECT content FROM chunks")]
+            self.assertTrue(chunk_sizes)
+            self.assertLessEqual(max(chunk_sizes), 8 * 1024)
+
+    def test_preserves_line_count_chunking_when_content_is_under_the_byte_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            corpus = root / "corpus"
+            corpus.mkdir()
+            lines = [f"line {number}" for number in range(1, 51)]
+            (corpus / "lines.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            database = root / "index.sqlite"
+
+            build_index(corpus, database)
+
+            with sqlite3.connect(database) as connection:
+                rows = connection.execute(
+                    "SELECT line_start, line_end, content FROM chunks ORDER BY rowid"
+                ).fetchall()
+            self.assertEqual(
+                rows,
+                [
+                    (1, 40, "\n".join(lines[:40])),
+                    (31, 50, "\n".join(lines[30:])),
+                ],
+            )
 
 
 class PullRequestLintTests(unittest.TestCase):
@@ -699,8 +939,6 @@ class PullRequestLintTests(unittest.TestCase):
                     create_server(database)
 
     def test_health_contracts_keep_search_and_follow_the_environment_mode(self) -> None:
-        from aiweekend_target.repo_rag.index import build_index
-
         repository = Path(__file__).parents[1]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

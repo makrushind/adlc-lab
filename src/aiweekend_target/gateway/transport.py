@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -18,7 +17,37 @@ CHAT_URL = f"{ROUTER_URL}/chat/completions"
 PROBE_TIMEOUT = httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)
 CHAT_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)
 MAX_ERROR_SAMPLE_BYTES = 16 * 1024
-_SAFE_UPSTREAM_FIELD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
+_SAFE_ERROR_TYPES = frozenset({
+    "authentication_error",
+    "generation_error",
+    "invalid_request_error",
+    "not_found_error",
+    "permission_error",
+    "rate_limit_error",
+    "server_error",
+})
+_SAFE_ERROR_CODES = frozenset({
+    "context_length_exceeded",
+    "generation_failed",
+    "invalid_api_key",
+    "model_not_found",
+    "rate_limit_exceeded",
+    "tool_validation_failed",
+    "unsupported_value",
+})
+_SAFE_ERROR_PARAMS = frozenset({
+    "max_completion_tokens",
+    "max_tokens",
+    "messages",
+    "model",
+    "response_format",
+    "stop",
+    "stream",
+    "temperature",
+    "tool_choice",
+    "tools",
+    "top_p",
+})
 
 
 @dataclass(frozen=True)
@@ -53,15 +82,14 @@ def _provider_error() -> TargetError:
 
 
 def _declared_error_body_length(response: httpx.Response) -> int | None:
-    try:
-        length = int(response.headers.get("content-length", ""))
-    except ValueError:
+    value = response.headers.get("content-length")
+    if type(value) is not str or not value or not value.isascii() or not value.isdecimal():
         return None
-    return length if length >= 0 else None
+    return int(value)
 
 
-def _safe_upstream_field(value: object) -> str | None:
-    if type(value) is str and _SAFE_UPSTREAM_FIELD.fullmatch(value) is not None:
+def _safe_upstream_field(value: object, allowed: frozenset[str]) -> str | None:
+    if type(value) is str and value in allowed:
         return value
     return None
 
@@ -79,9 +107,9 @@ def _error_diagnostics(status_code: int, sample: bytes, truncated: bool) -> dict
         has_failed_generation = "failed_generation" in payload
         error = payload.get("error")
         if isinstance(error, Mapping):
-            error_type = _safe_upstream_field(error.get("type"))
-            error_code = _safe_upstream_field(error.get("code"))
-            error_param = _safe_upstream_field(error.get("param"))
+            error_type = _safe_upstream_field(error.get("type"), _SAFE_ERROR_TYPES)
+            error_code = _safe_upstream_field(error.get("code"), _SAFE_ERROR_CODES)
+            error_param = _safe_upstream_field(error.get("param"), _SAFE_ERROR_PARAMS)
     return {
         "status": status_code,
         "error_type": error_type,
@@ -96,7 +124,7 @@ def _error_diagnostics(status_code: int, sample: bytes, truncated: bool) -> dict
 
 async def _bounded_error_diagnostics(response: httpx.Response) -> dict[str, object]:
     declared_length = _declared_error_body_length(response)
-    if declared_length is not None and declared_length > MAX_ERROR_SAMPLE_BYTES:
+    if declared_length is None or declared_length > MAX_ERROR_SAMPLE_BYTES:
         return _error_diagnostics(response.status_code, b"", True)
     sample = bytearray()
     truncated = False
@@ -107,6 +135,10 @@ async def _bounded_error_diagnostics(response: httpx.Response) -> dict[str, obje
             truncated = True
             break
         sample.extend(chunk)
+        if len(sample) > MAX_ERROR_SAMPLE_BYTES:
+            del sample[MAX_ERROR_SAMPLE_BYTES:]
+            truncated = True
+            break
         if response.num_bytes_downloaded > MAX_ERROR_SAMPLE_BYTES:
             truncated = True
         if len(sample) == MAX_ERROR_SAMPLE_BYTES:
