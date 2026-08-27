@@ -74,11 +74,45 @@ class PrepareReviewTests(unittest.TestCase):
             ),
         )
 
+    def test_parses_git_minimum_index_abbreviation(self) -> None:
+        document = (
+            "diff --git a/app.py b/app.py\n"
+            "index ecfd..ee7b 100644\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+
+        self.assertEqual(
+            parse_unified_diff(document),
+            (ReviewChange("app.py", (1,), False),),
+        )
+
+    def test_parses_sha256_empty_blob_abbreviation(self) -> None:
+        document = (
+            "diff --git a/empty.py b/empty.py\n"
+            "new file mode 100644\n"
+            "index 0000..473a\n"
+        )
+
+        self.assertEqual(
+            parse_unified_diff(document),
+            (ReviewChange("empty.py", (), False),),
+        )
+
     def test_rejects_incomplete_or_contradictory_metadata_only_records(self) -> None:
         for document in (
             "diff --git a/script.py b/script.py\nold mode 100644\n",
             "diff --git a/script.py b/script.py\nold mode 100644\nnew mode 100644\n",
             "diff --git a/empty.py b/empty.py\nnew file mode 100644\ndeleted file mode 100644\n",
+            "diff --git a/empty.py b/empty.py\nnew file mode 100644\nindex 0000000..e69de29 100755\n",
+            "diff --git a/empty.py b/empty.py\ndeleted file mode 100755\nindex e69de29..0000000 100644\n",
+            "diff --git a/empty.py b/empty.py\nnew file mode 100644\nindex 0000..e69d 100644\n",
+            "diff --git a/empty.py b/empty.py\ndeleted file mode 100755\nindex e69d..0000 100755\n",
+            "diff --git a/empty.py b/empty.py\nnew file mode 100644\nindex 0000000..deadbee\n",
+            "diff --git a/empty.py b/empty.py\nnew file mode 100644\nindex 0000..e69de29\n",
         ):
             with self.subTest(document=document), self.assertRaises(TargetError) as raised:
                 parse_unified_diff(document)

@@ -26,8 +26,12 @@ _SKIPPED_DIRECTORIES = frozenset({
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
 })
 _HUNK = re.compile(r"^@@ -(?P<old_start>0|[1-9][0-9]*)(?:,(?P<old_count>[0-9]+))? \+(?P<new_start>0|[1-9][0-9]*)(?:,(?P<new_count>[0-9]+))? @@(?: .*)?$")
-_INDEX = re.compile(r"^index (?P<old>[0-9a-f]{7,64})\.\.(?P<new>[0-9a-f]{7,64})(?: (?P<mode>[0-7]{6}))?$")
+_INDEX = re.compile(r"^index (?P<old>[0-9a-f]{4,64})\.\.(?P<new>[0-9a-f]{4,64})(?: (?P<mode>[0-7]{6}))?$")
 _MODE = re.compile(r"^[0-7]{6}$")
+_EMPTY_BLOB_HASHES = (
+    "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+    "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",
+)
 
 
 @dataclass(frozen=True)
@@ -135,6 +139,7 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
     new_file_mode: str | None = None
     deleted_file_mode: str | None = None
     index_hashes: tuple[str, str] | None = None
+    index_mode: str | None = None
     has_file_headers = False
     position = 0
     while position < len(record) and not record[position].startswith("@@ "):
@@ -162,7 +167,11 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
             match = _INDEX.fullmatch(line)
             if match is None:
                 raise _policy("diff has malformed metadata")
-            index_hashes = (match["old"], match["new"])
+            old_hash, new_hash = match["old"], match["new"]
+            if len(old_hash) != len(new_hash):
+                raise _policy("diff has malformed metadata")
+            index_hashes = (old_hash, new_hash)
+            index_mode = match["mode"]
         elif line.startswith("old mode "):
             old_mode = _record_mode(old_mode, line.removeprefix("old mode "))
         elif line.startswith("new mode "):
@@ -189,6 +198,12 @@ def _parse_record(old_from_git: str, new_from_git: str, record: list[str]) -> Re
     if new_file_mode is not None and deleted_file_mode is not None:
         raise _policy("diff has contradictory metadata")
     if (new_file_mode is not None or deleted_file_mode is not None) and old_mode is not None:
+        raise _policy("diff has contradictory metadata")
+    if index_mode is not None and (
+        old_mode is not None
+        or new_file_mode is not None
+        or deleted_file_mode is not None
+    ):
         raise _policy("diff has contradictory metadata")
     if not has_file_headers:
         if position != len(record):
@@ -285,7 +300,8 @@ def _empty_file_index(index_hashes: tuple[str, str] | None, *, added: bool) -> b
     if index_hashes is None:
         return False
     old_hash, new_hash = index_hashes
-    return (not old_hash.strip("0") and bool(new_hash.strip("0"))) if added else (bool(old_hash.strip("0")) and not new_hash.strip("0"))
+    absent_hash, present_hash = (old_hash, new_hash) if added else (new_hash, old_hash)
+    return not absent_hash.strip("0") and any(full_hash.startswith(present_hash) for full_hash in _EMPTY_BLOB_HASHES)
 
 
 def _git_paths(line: str, record: list[str]) -> tuple[str, str]:
