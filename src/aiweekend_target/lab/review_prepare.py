@@ -51,7 +51,7 @@ def parse_unified_diff(document: str) -> tuple[ReviewChange, ...]:
         encoded = document.encode("utf-8")
     except UnicodeEncodeError as error:
         raise _policy("diff must be UTF-8 text") from error
-    if len(encoded) > _MAX_DIFF_BYTES or "GIT binary patch" in document or re.search(r"^Binary files .+ differ$", document, re.MULTILINE):
+    if len(encoded) > _MAX_DIFF_BYTES:
         raise _policy("diff is binary or oversized")
 
     lines = document.splitlines()
@@ -67,6 +67,8 @@ def parse_unified_diff(document: str) -> tuple[ReviewChange, ...]:
         while position < len(lines) and not lines[position].startswith("diff --git "):
             record.append(lines[position])
             position += 1
+        if "GIT binary patch" in record or any(re.fullmatch(r"Binary files .+ differ", line) for line in record):
+            raise _policy("diff is binary or oversized")
         old_from_git, new_from_git = _git_paths(header, record)
         _reject_credential(old_from_git)
         _reject_credential(new_from_git)

@@ -325,6 +325,23 @@ class PrepareReviewTests(unittest.TestCase):
                 parse_unified_diff(document)
             self.assertEqual(raised.exception.code, ErrorCode.POLICY)
 
+    def test_accepts_binary_marker_text_inside_a_text_hunk(self) -> None:
+        document = (
+            "diff --git a/notes.py b/notes.py\n"
+            "new file mode 100644\n"
+            "index 0000000..1234567\n"
+            "--- /dev/null\n"
+            "+++ b/notes.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+GIT binary patch\n"
+            "+Binary files a/app.py and b/app.py differ\n"
+        )
+
+        self.assertEqual(
+            parse_unified_diff(document),
+            (ReviewChange("notes.py", (1, 2), False),),
+        )
+
     def test_rejects_missing_changed_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
