@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import stat
 from pathlib import Path, PurePosixPath
 from typing import TypedDict, cast
@@ -14,6 +15,9 @@ MAX_TARGETS = 100
 MAX_ADDED_LINES = 10_000
 MAX_DIAGNOSTICS = 100
 MAX_FILE_BYTES = 256 * 1024
+MAX_PATH_BYTES = 512
+MAX_POSITION = MAX_FILE_BYTES
+MAX_RESPONSE_BYTES = 256 * 1024
 RULE = "ADLC001"
 SEVERITY = "high"
 MESSAGE = "Avoid eval() on untrusted input"
@@ -83,15 +87,28 @@ def validate_lint_response(value: object) -> LintResponse:
             not isinstance(item, dict)
             or set(item) != {"path", "line", "column", "rule", "severity", "message"}
             or not _is_safe_python_path(item.get("path"))
-            or not _is_positive_int(item.get("line"))
-            or not _is_positive_int(item.get("column"))
+            or not _is_bounded_position(item.get("line"))
+            or not _is_bounded_position(item.get("column"))
             or item.get("rule") != RULE
             or item.get("severity") != SEVERITY
             or item.get("message") != MESSAGE
         ):
             raise TargetError(ErrorCode.MCP, "pull-request lint returned an invalid result")
-        diagnostics.append(cast(LintDiagnostic, dict(item)))
-    return {"diagnostics": diagnostics}
+        diagnostics.append(
+            {
+                "path": cast(str, item["path"]),
+                "line": cast(int, item["line"]),
+                "column": cast(int, item["column"]),
+                "rule": RULE,
+                "severity": SEVERITY,
+                "message": MESSAGE,
+            }
+        )
+    response: LintResponse = {"diagnostics": diagnostics}
+    canonical = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(canonical) > MAX_RESPONSE_BYTES:
+        raise TargetError(ErrorCode.MCP, "pull-request lint returned an invalid result")
+    return response
 
 
 def _validated_root(corpus_root: str | Path) -> Path:
@@ -154,7 +171,14 @@ def _read_target(root: Path, relative: str) -> str:
 
 
 def _is_safe_python_path(value: object) -> bool:
-    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+    if not isinstance(value, str) or not value or "\\" in value:
+        return False
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return False
+    try:
+        if len(value.encode("utf-8")) > MAX_PATH_BYTES:
+            return False
+    except UnicodeEncodeError:
         return False
     path = PurePosixPath(value)
     return not path.is_absolute() and ".." not in path.parts and path.as_posix() == value and value.endswith(".py")
@@ -166,6 +190,10 @@ def _character_column(line: str, byte_offset: int) -> int:
 
 def _is_positive_int(value: object) -> bool:
     return not isinstance(value, bool) and isinstance(value, int) and value > 0
+
+
+def _is_bounded_position(value: object) -> bool:
+    return _is_positive_int(value) and cast(int, value) <= MAX_POSITION
 
 
 __all__ = ["LintDiagnostic", "LintResponse", "LintTarget", "lint_pr", "validate_lint_response"]

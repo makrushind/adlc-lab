@@ -1,15 +1,17 @@
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import anyio
 from aiweekend_target.errors import ErrorCode, TargetError
-from aiweekend_target.lab.review_prepare import parse_unified_diff, prepare_review
+from aiweekend_target.lab.review_prepare import ReviewChange, parse_unified_diff, prepare_review
 from aiweekend_target.lab.scenarios import LabPaths
 from aiweekend_target.repo_rag.lint import lint_pr, validate_lint_response
 from aiweekend_target.repo_rag.search import RepoSearch
@@ -48,8 +50,39 @@ class PrepareReviewTests(unittest.TestCase):
         self.assertEqual(changes[0].path, "app.py")
         self.assertEqual(changes[0].added_lines, (6, 7))
         self.assertFalse(changes[0].deleted)
-        with self.assertRaises(Exception):
+        with self.assertRaises(FrozenInstanceError):
             changes[0].path = "other.py"
+
+    def test_parses_real_git_metadata_only_records(self) -> None:
+        document = (
+            "diff --git a/added-empty.py b/added-empty.py\n"
+            "new file mode 100644\n"
+            "index 0000000..e69de29\n"
+            "diff --git a/deleted-empty.py b/deleted-empty.py\n"
+            "deleted file mode 100644\n"
+            "index e69de29..0000000\n"
+            "diff --git a/script.py b/script.py\n"
+            "old mode 100644\n"
+            "new mode 100755\n"
+        )
+        self.assertEqual(
+            parse_unified_diff(document),
+            (
+                ReviewChange("added-empty.py", (), False),
+                ReviewChange("deleted-empty.py", (), True),
+                ReviewChange("script.py", (), False),
+            ),
+        )
+
+    def test_rejects_incomplete_or_contradictory_metadata_only_records(self) -> None:
+        for document in (
+            "diff --git a/script.py b/script.py\nold mode 100644\n",
+            "diff --git a/script.py b/script.py\nold mode 100644\nnew mode 100644\n",
+            "diff --git a/empty.py b/empty.py\nnew file mode 100644\ndeleted file mode 100644\n",
+        ):
+            with self.subTest(document=document), self.assertRaises(TargetError) as raised:
+                parse_unified_diff(document)
+            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
 
     def test_parses_added_and_renamed_files_and_rejects_malformed_records(self) -> None:
         added = "diff --git a/new.py b/new.py\nnew file mode 100644\n--- /dev/null\n+++ b/new.py\n@@ -0,0 +1,2 @@\n+one\n+two\n"
@@ -129,6 +162,77 @@ class PrepareReviewTests(unittest.TestCase):
             with self.assertRaises(TargetError) as raised:
                 prepare_review(LabPaths(root / "workspace", root / "corpus", root / "rag-index"), source, diff, marker)
             self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+
+    def test_rejects_changed_python_below_skipped_directory_before_target_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            self._write(source, "vendor/check.py", "value = eval(source)\n")
+            diff = root / "pr.diff"
+            diff.write_text(self._diff("vendor/check.py", "vendor/check.py"), encoding="utf-8")
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+            for target in (paths.workspace, paths.corpus, paths.rag_index):
+                self._write(target, "sentinel.txt", target.name)
+
+            with self.assertRaises(TargetError) as raised:
+                prepare_review(paths, source, diff, marker)
+
+            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+            for target in (paths.workspace, paths.corpus, paths.rag_index):
+                self.assertEqual((target / "sentinel.txt").read_text(encoding="utf-8"), target.name)
+            self.assertFalse((paths.workspace / "pr.diff").exists())
+
+    def test_rejects_credential_paths_from_every_diff_direction(self) -> None:
+        cases = (
+            (
+                "deleted env",
+                "diff --git a/.env b/.env\n"
+                "deleted file mode 100644\n"
+                "--- a/.env\n"
+                "+++ /dev/null\n"
+                "@@ -1 +0,0 @@\n-secret\n",
+            ),
+            (
+                "rename away pem",
+                "diff --git a/secrets/client.pem b/client.py\n"
+                "similarity index 100%\n"
+                "rename from secrets/client.pem\n"
+                "rename to client.py\n",
+            ),
+            (
+                "rename to key",
+                "diff --git a/client.py b/secrets/client.key\n"
+                "similarity index 100%\n"
+                "rename from client.py\n"
+                "rename to secrets/client.key\n",
+            ),
+            (
+                "added env",
+                "diff --git a/config/.env b/config/.env\n"
+                "new file mode 100644\n"
+                "index 0000000..e69de29\n",
+            ),
+        )
+        for name, document in cases:
+            with self.subTest(name=name), self.assertRaises(TargetError) as raised:
+                parse_unified_diff(document)
+            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            self._write(source, "app.py", "value = 1\n")
+            diff = self._write(root, "credential.diff", cases[0][1])
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+            self._write(paths.workspace, "sentinel.txt", "unchanged")
+            with self.assertRaises(TargetError):
+                prepare_review(paths, source, diff, marker)
+            self.assertEqual((paths.workspace / "sentinel.txt").read_text(encoding="utf-8"), "unchanged")
+            self.assertFalse((paths.workspace / "pr.diff").exists())
 
     def test_rejects_added_and_deleted_hunks_with_opposite_side_content(self) -> None:
         contradictory_deleted = (
@@ -244,6 +348,137 @@ class PrepareReviewTests(unittest.TestCase):
                     prepare_review(paths, source, root / "pr.diff", root / "baseline-scenario.json")
                 self.assertEqual(raised.exception.code, ErrorCode.POLICY)
 
+    def test_rejects_oversized_preparation_inputs_without_path_read_bytes(self) -> None:
+        for kind in ("diff", "file", "marker"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source"
+                source.mkdir()
+                source_file = self._write(source, "app.py", "old\n")
+                diff = self._write(root, "pr.diff", self._diff("app.py", "app.py"))
+                marker = self._write(root, "marker.json", "{}")
+                blocked = {"diff": diff, "file": source_file, "marker": marker}[kind]
+                if kind == "diff":
+                    diff.write_bytes(b"x" * (512 * 1024 + 1))
+                elif kind == "file":
+                    source_file.write_bytes(b"x" * (256 * 1024 + 1))
+                else:
+                    marker.write_bytes(b"x" * (16 * 1024 + 1))
+                original_read_bytes = Path.read_bytes
+
+                def guarded_read_bytes(path: Path) -> bytes:
+                    if path == blocked:
+                        raise AssertionError("oversized path must not use Path.read_bytes")
+                    return original_read_bytes(path)
+
+                paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+                with mock.patch.object(Path, "read_bytes", autospec=True, side_effect=guarded_read_bytes):
+                    with self.assertRaises(TargetError) as raised:
+                        prepare_review(paths, source, diff, marker)
+                self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+
+    def test_rejects_checkout_file_swapped_during_descriptor_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            target = self._write(source, "app.py", "old\n")
+            original_inode = target.stat().st_ino
+            diff = self._write(root, "pr.diff", self._diff("app.py", "app.py"))
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+            self._write(paths.workspace, "sentinel.txt", "unchanged")
+            real_read = os.read
+            swapped = False
+
+            def swap_during_read(descriptor: int, amount: int) -> bytes:
+                nonlocal swapped
+                if not swapped and os.fstat(descriptor).st_ino == original_inode:
+                    swapped = True
+                    target.rename(source / "original.py")
+                    target.write_text("replacement\n", encoding="utf-8")
+                return real_read(descriptor, amount)
+
+            with mock.patch("aiweekend_target.lab.review_prepare.os.read", side_effect=swap_during_read):
+                with self.assertRaises(TargetError) as raised:
+                    prepare_review(paths, source, diff, marker)
+            self.assertTrue(swapped)
+            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+            self.assertEqual((paths.workspace / "sentinel.txt").read_text(encoding="utf-8"), "unchanged")
+
+    def test_walk_errors_fail_closed_before_target_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            self._write(source, "app.py", "old\n")
+            diff = self._write(root, "pr.diff", self._diff("app.py", "app.py"))
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+            self._write(paths.corpus, "sentinel.txt", "unchanged")
+
+            def failing_walk(*_: object, onerror: object = None, **__: object) -> object:
+                if callable(onerror):
+                    onerror(PermissionError("sensitive traversal path"))
+                return iter(())
+
+            with mock.patch("aiweekend_target.lab.review_prepare.os.walk", side_effect=failing_walk):
+                with self.assertRaises(TargetError) as raised:
+                    prepare_review(paths, source, diff, marker)
+            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+            self.assertNotIn("sensitive", str(raised.exception))
+            self.assertEqual((paths.corpus / "sentinel.txt").read_text(encoding="utf-8"), "unchanged")
+
+    def test_rejects_overlapping_preparation_roots_before_staging(self) -> None:
+        for kind in ("source equal", "source ancestor", "destination ancestor", "diff contained", "targets overlap", "symlink alias"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source"
+                source.mkdir()
+                self._write(source, "app.py", "old\n")
+                diff_parent = root / "inputs"
+                diff = self._write(diff_parent, "pr.diff", self._diff("app.py", "app.py"))
+                marker = self._write(root, "marker.json", "{}")
+                paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+                if kind == "source equal":
+                    paths = LabPaths(source, paths.corpus, paths.rag_index)
+                elif kind == "source ancestor":
+                    paths = LabPaths(source / "generated", paths.corpus, paths.rag_index)
+                elif kind == "destination ancestor":
+                    paths = LabPaths(root, paths.corpus, paths.rag_index)
+                elif kind == "diff contained":
+                    paths = LabPaths(diff_parent, paths.corpus, paths.rag_index)
+                elif kind == "targets overlap":
+                    paths = LabPaths(root / "targets", root / "targets" / "corpus", paths.rag_index)
+                else:
+                    alias = root / "source-alias"
+                    alias.symlink_to(source, target_is_directory=True)
+                    paths = LabPaths(alias, paths.corpus, paths.rag_index)
+                source_snapshot = {
+                    item.relative_to(source).as_posix(): item.read_bytes()
+                    for item in source.rglob("*")
+                    if item.is_file()
+                }
+                diff_snapshot = diff.read_bytes()
+
+                with mock.patch(
+                    "aiweekend_target.lab.review_prepare.tempfile.mkdtemp",
+                    side_effect=AssertionError("overlap must fail before staging"),
+                ):
+                    with self.assertRaises(TargetError) as raised:
+                        prepare_review(paths, source, diff, marker)
+
+                self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+                self.assertEqual(
+                    {
+                        item.relative_to(source).as_posix(): item.read_bytes()
+                        for item in source.rglob("*")
+                        if item.is_file()
+                    },
+                    source_snapshot,
+                )
+                self.assertEqual(diff.read_bytes(), diff_snapshot)
+
     def test_preparation_creates_all_volume_outputs_and_cli_dispatches(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -351,6 +586,37 @@ class PullRequestLintTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(TargetError):
                 validate_lint_response(invalid)
 
+    def test_lint_response_bounds_paths_positions_and_canonical_size(self) -> None:
+        def diagnostic(path: str, line: int = 1, column: int = 1) -> dict[str, object]:
+            return {
+                "path": path,
+                "line": line,
+                "column": column,
+                "rule": "ADLC001",
+                "severity": "high",
+                "message": "Avoid eval() on untrusted input",
+            }
+
+        edge = {"diagnostics": [diagnostic("a" + "é" * 254 + ".py", 262_144, 262_144)]}
+        self.assertEqual(validate_lint_response(edge), edge)
+        oversized = {"diagnostics": [diagnostic(f"{number:03d}-" + "x" * 2_620 + ".py") for number in range(100)]}
+        self.assertGreater(
+            len(json.dumps(oversized, ensure_ascii=False, separators=(",", ":")).encode("utf-8")),
+            256 * 1024,
+        )
+        for invalid in (
+            {"diagnostics": [diagnostic("aa" + "é" * 254 + ".py")]},
+            {"diagnostics": [diagnostic("bad\npath.py")]},
+            {"diagnostics": [diagnostic("bad\tpath.py")]},
+            {"diagnostics": [diagnostic("bad\x7fpath.py")]},
+            {"diagnostics": [diagnostic("good.py", 262_145, 1)]},
+            {"diagnostics": [diagnostic("good.py", 1, 262_145)]},
+            oversized,
+        ):
+            with self.subTest(path=invalid["diagnostics"][0]["path"][:24]), self.assertRaises(TargetError) as raised:
+                validate_lint_response(invalid)
+            self.assertEqual(raised.exception.code, ErrorCode.MCP)
+
     def test_orders_and_caps_diagnostics_and_target_lines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -369,11 +635,14 @@ class PullRequestLintTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = root / "index.sqlite"
-            self.assertEqual([tool.name for tool in anyio.run(create_server(database).list_tools)], ["search_repo"])
-            self.assertEqual(
-                [tool.name for tool in anyio.run(create_server(database, review_mode=True, corpus_root=root).list_tools)],
-                ["search_repo", "lint_pr"],
-            )
+            with mock.patch.dict("os.environ", {}, clear=False):
+                os.environ.pop("ADLC_PR_REVIEW_MODE", None)
+                self.assertEqual([tool.name for tool in anyio.run(create_server(database).list_tools)], ["search_repo"])
+            with mock.patch.dict("os.environ", {"ADLC_PR_REVIEW_MODE": "0"}, clear=False):
+                self.assertEqual(
+                    [tool.name for tool in anyio.run(create_server(database, review_mode=True, corpus_root=root).list_tools)],
+                    ["search_repo", "lint_pr"],
+                )
             with mock.patch.dict("os.environ", {"ADLC_PR_REVIEW_MODE": "invalid"}, clear=False):
                 with self.assertRaises(TargetError):
                     create_server(database)
@@ -391,7 +660,9 @@ class PullRequestLintTests(unittest.TestCase):
             marker = root / "scenario.json"
             marker.write_text('{"schema":1,"id":"baseline","attack_surface":"none","canary":null,"payload_file":null}\n', encoding="utf-8")
             scenarios = repository / "scenarios"
-            self.assertEqual(anyio.run(health_check, database, marker, scenarios), {"status": "ready"})
+            with mock.patch.dict("os.environ", {}, clear=False):
+                os.environ.pop("ADLC_PR_REVIEW_MODE", None)
+                self.assertEqual(anyio.run(health_check, database, marker, scenarios), {"status": "ready"})
             with mock.patch.dict("os.environ", {"ADLC_PR_REVIEW_MODE": "1"}, clear=False):
                 self.assertEqual(anyio.run(health_check, database, marker, scenarios), {"status": "ready"})
 
@@ -639,6 +910,23 @@ class PullRequestReviewLoopTests(unittest.TestCase):
         with mock.patch.object(__main__, "run_pr_review", return_value=0) as run:
             self.assertEqual(__main__.main(["pr-review"], output=output), 0)
         run.assert_called_once_with(output=output)
+
+    def test_credential_diff_is_rejected_before_external_review_boundaries(self) -> None:
+        document = (
+            "diff --git a/secrets/client.pem b/pkg/client.py\n"
+            "similarity index 100%\n"
+            "rename from secrets/client.pem\n"
+            "rename to pkg/client.py\n"
+        )
+        status, requests, events, session, order = self._exercise(diff=document)
+        self.assertEqual(status, 1)
+        self.assertEqual(requests, [])
+        self.assertEqual(session.calls, [])
+        self.assertEqual(order, [])
+        self.assertEqual(
+            events,
+            [{"schema": 1, "type": "pr_review_error", "ok": False, "code": "POLICY", "stage": "diff"}],
+        )
 
     def test_lint_preflight_accepts_exact_caps_and_rejects_overages_before_boundaries(self) -> None:
         exactly_100_targets = "".join(self._added_file_diff(f"pkg/{number}.py", 1) for number in range(100))
