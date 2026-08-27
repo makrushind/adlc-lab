@@ -411,6 +411,93 @@ class PrepareReviewTests(unittest.TestCase):
                 self.assertEqual((target / "sentinel.txt").read_text(encoding="utf-8"), target.name)
             self.assertFalse((paths.workspace / "pr.diff").exists())
 
+    def test_accepts_modified_crlf_content_with_lf_diff_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            expected = b"before\r\nnew\r\nafter\r\n"
+            self._write(source, "app.py", expected)
+            diff = self._write(
+                root,
+                "pr.diff",
+                "diff --git a/app.py b/app.py\n"
+                "--- a/app.py\n"
+                "+++ b/app.py\n"
+                "@@ -1,3 +1,3 @@\n"
+                " before\r\n"
+                "-old\r\n"
+                "+new\r\n"
+                " after\r\n",
+            )
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+
+            try:
+                result = prepare_review(paths, source, diff, marker)
+            except TargetError as error:
+                self.fail(f"valid modified CRLF content was rejected: {error}")
+
+            self.assertTrue(result["prepared"])
+            self.assertEqual((paths.corpus / "app.py").read_bytes(), expected)
+
+    def test_accepts_renamed_unicode_line_separator_content_with_lf_diff_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            expected = "before\u2028after\n".encode("utf-8")
+            self._write(source, "new.py", expected)
+            diff = self._write(
+                root,
+                "pr.diff",
+                "diff --git a/old.py b/new.py\n"
+                "similarity index 50%\n"
+                "rename from old.py\n"
+                "rename to new.py\n"
+                "--- a/old.py\n"
+                "+++ b/new.py\n"
+                "@@ -1 +1 @@\n"
+                "-old\n"
+                "+before\u2028after\n",
+            )
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+
+            try:
+                result = prepare_review(paths, source, diff, marker)
+            except TargetError as error:
+                self.fail(f"valid renamed Unicode-line-separator content was rejected: {error}")
+
+            self.assertTrue(result["prepared"])
+            self.assertEqual((paths.corpus / "new.py").read_bytes(), expected)
+
+    def test_rejects_modified_crlf_content_mismatch_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            self._write(source, "app.py", b"actual\r\n")
+            diff = self._write(
+                root,
+                "pr.diff",
+                "diff --git a/app.py b/app.py\n"
+                "--- a/app.py\n"
+                "+++ b/app.py\n"
+                "@@ -1 +1 @@\n"
+                "-old\r\n"
+                "+expected\r\n",
+            )
+            marker = self._write(root, "marker.json", "{}")
+            paths = LabPaths(root / "workspace", root / "corpus", root / "rag-index")
+            self._write(paths.workspace, "sentinel.txt", "unchanged")
+
+            with self.assertRaises(TargetError) as raised:
+                prepare_review(paths, source, diff, marker)
+
+            self.assertEqual(raised.exception.code, ErrorCode.POLICY)
+            self.assertEqual((paths.workspace / "sentinel.txt").read_text(encoding="utf-8"), "unchanged")
+
     def test_rejects_nonempty_checkout_for_metadata_only_empty_add_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

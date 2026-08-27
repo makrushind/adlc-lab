@@ -630,9 +630,11 @@ def _validate_changed_targets(
                     raise _policy("diff does not match the source checkout")
                 continue
             try:
-                checkout_lines = data.decode("utf-8").splitlines()
+                checkout_lines = data.decode("utf-8").split("\n")
             except UnicodeDecodeError as error:
                 raise _policy("changed target is not UTF-8") from error
+            if checkout_lines[-1] == "":
+                checkout_lines.pop()
             for new_start, expected_lines in change.new_hunks:
                 if not expected_lines:
                     if not 0 <= new_start <= len(checkout_lines):
