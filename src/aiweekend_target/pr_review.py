@@ -91,6 +91,19 @@ def _raw_review_prompt(diff: str) -> str:
     return _PROMPT_PREFIX + diff + _PROMPT_SUFFIX
 
 
+def _digest_safe_text(value: str) -> str:
+    """Encode boundary-significant data before canonical JSON rendering."""
+    return value.replace("<", "\\u003c")
+
+
+def _excerpt_json(entry: Mapping[str, object]) -> str:
+    return json.dumps(dict(entry), ensure_ascii=False, separators=(",", ":"))
+
+
+def _excerpt_bytes(entry: Mapping[str, object]) -> int:
+    return len(_excerpt_json(entry).encode("utf-8"))
+
+
 def _digest_records(document: str, changes: tuple[ReviewChange, ...]) -> tuple[list[dict[str, object]], list[list[dict[str, object]]]]:
     """Collect stable, validated file metadata and literal added-line excerpts."""
     records: list[dict[str, object]] = []
@@ -114,17 +127,17 @@ def _digest_records(document: str, changes: tuple[ReviewChange, ...]) -> tuple[l
             status = "renamed"
         elif change.deleted:
             status = "deleted"
-        elif any(line.startswith("new file mode ") for line in record_lines):
+        elif any(line.startswith("--- /dev/null") for line in record_lines):
             status = "added"
         else:
             status = "modified"
         records.append(
             {
                 "status": status,
-                "path": change.path,
-                "old_path": old_path,
-                "new_path": new_path,
-                "hunks": [line for line in record_lines if line.startswith("@@ ")],
+                "path": _digest_safe_text(change.path),
+                "old_path": _digest_safe_text(old_path),
+                "new_path": _digest_safe_text(new_path),
+                "hunks": [_digest_safe_text(line) for line in record_lines if line.startswith("@@ ")],
             }
         )
         added = set(change.added_lines)
@@ -133,28 +146,42 @@ def _digest_records(document: str, changes: tuple[ReviewChange, ...]) -> tuple[l
             for offset, content in enumerate(new_side):
                 line = start + offset
                 if line in added:
-                    file_excerpts.append({"path": change.path, "line": line, "content": content})
+                    file_excerpts.append({"path": _digest_safe_text(change.path), "line": line, "content": _digest_safe_text(content)})
         excerpts.append(file_excerpts)
     if position != len(lines):
         raise _ReviewFailure(ErrorCode.POLICY.value, "diff")
     return records, excerpts
 
 
-def _truncate_excerpt(content: str) -> tuple[str, int]:
-    """Keep one JSON-string excerpt within its byte limit without splitting Unicode."""
-    serialized = json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if len(serialized) <= _MAX_EXCERPT_LINE_BYTES:
-        return content, 0
+def _truncate_excerpt(entry: Mapping[str, object]) -> tuple[dict[str, object], int]:
+    """Keep one complete canonical excerpt record within its byte limit."""
+    original = dict(entry)
+    original_bytes = _excerpt_bytes(original)
+    if original_bytes <= _MAX_EXCERPT_LINE_BYTES:
+        return original, original_bytes
+    bounded = {**original, "content": ""}
+    if _excerpt_bytes(bounded) > _MAX_EXCERPT_LINE_BYTES:
+        path = str(original["path"])
+        low, high = 0, len(path)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = {**bounded, "path": path[:middle]}
+            if _excerpt_bytes(candidate) <= _MAX_EXCERPT_LINE_BYTES:
+                low = middle
+            else:
+                high = middle - 1
+        bounded["path"] = path[:low]
+    content = str(original["content"])
     low, high = 0, len(content)
     while low < high:
         middle = (low + high + 1) // 2
-        candidate = content[:middle]
-        if len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= _MAX_EXCERPT_LINE_BYTES:
+        candidate = {**bounded, "content": content[:middle]}
+        if _excerpt_bytes(candidate) <= _MAX_EXCERPT_LINE_BYTES:
             low = middle
         else:
             high = middle - 1
-    kept = content[:low]
-    return kept, len(content.encode("utf-8")) - len(kept.encode("utf-8"))
+    bounded["content"] = content[:low]
+    return bounded, original_bytes
 
 
 def _manifest(records: list[dict[str, object]]) -> tuple[str, int, str | None]:
@@ -178,24 +205,23 @@ def _manifest(records: list[dict[str, object]]) -> tuple[str, int, str | None]:
 def _digest_prompt(document: str, changes: tuple[ReviewChange, ...]) -> str:
     records, file_excerpts = _digest_records(document, changes)
     manifest, omitted_files, manifest_hash = _manifest(records)
-    excerpt_queues: list[list[dict[str, object]]] = []
-    omitted_bytes = 0
+    excerpt_queues: list[list[tuple[dict[str, object], int]]] = []
     for file_entries in file_excerpts:
-        queue: list[dict[str, object]] = []
+        queue: list[tuple[dict[str, object], int]] = []
         for entry in file_entries:
-            content, missing_bytes = _truncate_excerpt(str(entry["content"]))
-            omitted_bytes += missing_bytes
-            queue.append({**entry, "content": content})
+            queue.append(_truncate_excerpt(entry))
         excerpt_queues.append(queue)
     total_lines = sum(len(queue) for queue in excerpt_queues)
+    total_excerpt_bytes = sum(original_bytes for queue in excerpt_queues for _, original_bytes in queue)
     digest_hash = hashlib.sha256(document.encode("utf-8")).hexdigest()
 
     def render(selected: list[dict[str, object]]) -> str:
+        omitted_bytes = total_excerpt_bytes - sum(_excerpt_bytes(entry) for entry in selected)
         parts = ["BOUNDED_DIFF_DIGEST", "MANIFEST", manifest]
         if omitted_files:
             parts.append(f"OMITTED_FILES count={omitted_files} manifest_sha256={manifest_hash}")
         parts.append("EXCERPTS")
-        parts.extend(json.dumps(item, ensure_ascii=False, separators=(",", ":")) for item in selected)
+        parts.extend(_excerpt_json(item) for item in selected)
         parts.extend(
             (
                 f"OMITTED_LINES count={total_lines - len(selected)}",
@@ -212,7 +238,7 @@ def _digest_prompt(document: str, changes: tuple[ReviewChange, ...]) -> str:
         for index, queue in enumerate(excerpt_queues):
             if positions[index] >= len(queue):
                 continue
-            candidate = [*selected, queue[positions[index]]]
+            candidate = [*selected, queue[positions[index]][0]]
             if _canonical_message_bytes({"role": "user", "content": render(candidate)}) > _MAX_FIRST_MESSAGE_BYTES:
                 continue
             selected = candidate

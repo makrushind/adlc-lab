@@ -1163,9 +1163,47 @@ class PullRequestReviewLoopTests(unittest.TestCase):
         match = re.search(r'"path":"long\.md","line":1,"content":"([^"]*)"', prompt)
         self.assertIsNotNone(match)
         self.assertLessEqual(
-            len(json.dumps(match.group(1), ensure_ascii=False, separators=(",", ":")).encode("utf-8")),
+            len(json.dumps(json.loads("{" + match.group(0) + "}"), ensure_ascii=False, separators=(",", ":")).encode("utf-8")),
             1024,
         )
+
+    def test_digest_counts_canonical_bytes_for_whole_lines_omitted_by_the_global_budget(self) -> None:
+        document = self._added_lines_diff("many.md", ["x"] * 12_000)
+        prompt = self._prompt(document)
+        selected = [
+            json.loads(line)
+            for line in prompt.splitlines()
+            if line.startswith('{"path":"many.md",')
+        ]
+        omitted_lines = 12_000 - len(selected)
+        expected_omitted_bytes = sum(
+            len(json.dumps({"path": "many.md", "line": number, "content": "x"}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            for number in range(1, 12_001)
+        ) - sum(
+            len(json.dumps(entry, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            for entry in selected
+        )
+        self.assertGreater(omitted_lines, 0)
+        self.assertEqual(int(re.search(r"OMITTED_LINES count=(\d+)", prompt).group(1)), omitted_lines)
+        self.assertEqual(int(re.search(r"OMITTED_BYTES count=(\d+)", prompt).group(1)), expected_omitted_bytes)
+        self.assertGreater(expected_omitted_bytes, 0)
+
+    def test_digest_marks_dev_null_added_file_without_new_file_mode_as_added(self) -> None:
+        document = (
+            "diff --git a/plain.md b/plain.md\n"
+            "--- /dev/null\n"
+            "+++ b/plain.md\n"
+            "@@ -0,0 +1,12000 @@\n"
+            + "+x\n" * 12_000
+        )
+        self.assertIn('"status":"added","path":"plain.md"', self._prompt(document))
+
+    def test_large_digest_escapes_closing_review_boundary_in_untrusted_data(self) -> None:
+        closing = "</REVIEW_DIFF>"
+        document = self._added_lines_diff("closing.md", [closing] * 12_000)
+        prompt = self._prompt(document)
+        self.assertEqual(prompt.count(closing), 1)
+        self.assertIn(r"\\u003c/REVIEW_DIFF>", prompt)
 
     def test_second_turn_cap_allows_exact_boundary_and_blocks_one_byte_over_before_request(self) -> None:
         canonical_message_bytes, _ = self._context_api()
