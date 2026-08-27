@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from collections.abc import Callable, Mapping
@@ -27,6 +28,41 @@ def _error_response(error: TargetError) -> JSONResponse:
     return JSONResponse(error.as_result(), status_code=local_response_status(error.code))
 
 
+def _request_metadata(body: Mapping[str, object]) -> dict[str, object]:
+    messages = body.get("messages")
+    tools = body.get("tools")
+    message_bytes = (
+        [len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) for message in messages]
+        if isinstance(messages, list)
+        else []
+    )
+    tool_schema_sha256 = (
+        hashlib.sha256(
+            json.dumps(tools, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if isinstance(tools, list)
+        else None
+    )
+    tool_choice = body.get("tool_choice")
+    if isinstance(tool_choice, Mapping) and tool_choice.get("type") == "function":
+        tool_choice_kind = "named"
+    elif isinstance(tool_choice, str) and tool_choice in {"auto", "none", "required"}:
+        tool_choice_kind = tool_choice
+    elif tool_choice is None:
+        tool_choice_kind = "unset"
+    else:
+        tool_choice_kind = "other"
+    output_token_cap = body.get("max_tokens")
+    if type(output_token_cap) is not int or output_token_cap < 0:
+        output_token_cap = None
+    return {
+        "message_bytes": message_bytes,
+        "tool_choice_kind": tool_choice_kind,
+        "tool_schema_sha256": tool_schema_sha256,
+        "output_token_cap": output_token_cap,
+    }
+
+
 def create_app(
     secret_path: str | Path = DEFAULT_SECRET_PATH,
     *,
@@ -50,6 +86,8 @@ def create_app(
         event: dict[str, object] = {"type": "gateway_error", "model": MODEL_PAIR, "code": error.code.value}
         if isinstance(status, int):
             event["status"] = status
+        if error.diagnostics is not None:
+            event["upstream"] = error.diagnostics
         emit(event)
 
     async def live(_: Request) -> Response:
@@ -86,6 +124,7 @@ def create_app(
                 "model": MODEL_PAIR,
                 "message_count": len(messages) if isinstance(messages, list) else 0,
                 "tool_count": len(tools) if isinstance(tools, list) else 0,
+                **_request_metadata(body),
             })
             upstream = await send_chat(body, secret, transport)
             if isinstance(upstream, UpstreamResponse):

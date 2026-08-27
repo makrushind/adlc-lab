@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import unittest
 from unittest.mock import patch
 
@@ -7,7 +9,7 @@ import httpx
 from aiweekend_target.__main__ import _health
 from aiweekend_target.errors import ErrorCode, TargetError
 from aiweekend_target.gateway.app import create_app
-from aiweekend_target.gateway.transport import _upstream_error
+from aiweekend_target.gateway.transport import _upstream_error, probe_available
 from aiweekend_target.lab.config import MODEL_PAIR
 
 
@@ -17,6 +19,32 @@ class GatewayErrorTests(unittest.TestCase):
 
     def test_rate_limited_upstream_response_is_quota_failure(self) -> None:
         self.assertEqual(_upstream_error(429).code, ErrorCode.QUOTA)
+
+    def test_probe_consumes_an_upstream_failure_before_its_client_closes(self) -> None:
+        class ClosingTransport(httpx.AsyncBaseTransport):
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def handle_async_request(self, _: httpx.Request) -> httpx.Response:
+                transport = self
+
+                class ResponseStream(httpx.AsyncByteStream):
+                    async def __aiter__(self):
+                        if transport.closed:
+                            raise httpx.ReadError("client closed before response read")
+                        yield b'{}'
+
+                    async def aclose(self) -> None:
+                        return None
+
+                return httpx.Response(400, stream=ResponseStream())
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        with self.assertRaises(TargetError) as captured:
+            asyncio.run(probe_available("secret", ClosingTransport()))
+        self.assertEqual(captured.exception.code, ErrorCode.PROVIDER)
 
     def test_health_command_unwraps_a_canonical_gateway_readiness_failure(self) -> None:
         class Response:
@@ -102,3 +130,199 @@ class GatewayChatAsgiTests(unittest.TestCase):
             response.json(),
             {"ok": False, "error": {"code": "PROVIDER", "message": "Hugging Face Router returned an invalid response", "details": None}, "exit_code": 1},
         )
+
+    def test_chat_response_stream_failure_returns_the_existing_provider_document(self) -> None:
+        class FailingResponseStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                raise httpx.ReadError("stream interrupted")
+                yield b""
+
+            async def aclose(self) -> None:
+                return None
+
+        def handler(_: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, stream=FailingResponseStream())
+
+        async def exercise() -> httpx.Response:
+            app = create_app(transport=httpx.MockTransport(handler))
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            with patch("aiweekend_target.gateway.app.read_secret", return_value="placeholder"):
+                async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+                    return await client.post("/v1/chat/completions", json={"model": MODEL_PAIR, "messages": []})
+
+        response = asyncio.run(exercise())
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json(),
+            {"ok": False, "error": {"code": "PROVIDER", "message": "Hugging Face Router is unavailable", "details": None}, "exit_code": 1},
+        )
+
+    def test_chat_upstream_failures_log_only_bounded_redacted_transport_metadata(self) -> None:
+        canary = "CANARY_HF_GATEWAY_TRANSPORT_MUST_NOT_APPEAR"
+        credential = "hf_transport_credential_must_not_appear"
+        secret = "hf_gateway_secret_must_not_appear"
+        bodies = [
+            (
+                "valid JSON",
+                json.dumps(
+                    {
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "tool_validation_failed",
+                            "param": "tools",
+                            "message": f"{canary} {credential}",
+                        }
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                "invalid_request_error",
+                "tool_validation_failed",
+                "tools",
+                False,
+                False,
+            ),
+            (
+                "invalid JSON",
+                f'{{"error":{{"message":"{canary} {credential}"}}'.encode("utf-8"),
+                None,
+                None,
+                None,
+                False,
+                False,
+            ),
+            (
+                "failed generation",
+                json.dumps(
+                    {
+                        "error": {"type": "generation_error", "code": "generation_failed", "param": None},
+                        "failed_generation": {"arguments": f"{canary} {credential}"},
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                "generation_error",
+                "generation_failed",
+                None,
+                True,
+                False,
+            ),
+            (
+                "oversized body",
+                (f'{canary} {credential} '.encode("utf-8") * 1_000),
+                None,
+                None,
+                None,
+                False,
+                True,
+            ),
+        ]
+        requests: list[httpx.Request] = []
+        logs: list[dict[str, object]] = []
+
+        class ResponseStream(httpx.AsyncByteStream):
+            def __init__(self, content: bytes) -> None:
+                self.content = content
+
+            async def __aiter__(self):
+                yield self.content
+
+            async def aclose(self) -> None:
+                return None
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            _, response_body, *_ = bodies[len(requests) - 1]
+            return httpx.Response(
+                400,
+                headers={"content-type": "application/json", "content-length": str(len(response_body))},
+                stream=ResponseStream(response_body),
+            )
+
+        async def exercise() -> list[httpx.Response]:
+            app = create_app(transport=httpx.MockTransport(handler), trace_sink=logs.append)
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            payload = {
+                "model": MODEL_PAIR,
+                "messages": [
+                    {"role": "user", "content": f"Review {canary} {credential}"},
+                    {"role": "tool", "content": json.dumps({"arguments": f"{canary} {credential}"})},
+                ],
+                "tools": [
+                    {"type": "function", "function": {"name": "search_repo", "description": f"{canary} {credential}"}}
+                ],
+                "tool_choice": {"type": "function", "function": {"name": "search_repo"}},
+                "max_tokens": 73,
+                "stream": False,
+            }
+            with patch("aiweekend_target.gateway.app.read_secret", return_value=secret):
+                async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+                    return [await client.post("/v1/chat/completions", json=payload) for _ in bodies]
+
+        responses = asyncio.run(exercise())
+
+        expected_payload = {
+            "model": MODEL_PAIR,
+            "messages": [
+                {"role": "user", "content": f"Review {canary} {credential}"},
+                {"role": "tool", "content": json.dumps({"arguments": f"{canary} {credential}"})},
+            ],
+            "tools": [{"type": "function", "function": {"name": "search_repo", "description": f"{canary} {credential}"}}],
+            "tool_choice": {"type": "function", "function": {"name": "search_repo"}},
+            "max_tokens": 73,
+            "stream": False,
+        }
+        expected_request = json.dumps(expected_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        expected_tool_hash = hashlib.sha256(
+            json.dumps(expected_payload["tools"], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        expected_message_bytes = [
+            len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            for message in expected_payload["messages"]
+        ]
+
+        self.assertEqual(len(requests), len(bodies))
+        for request in requests:
+            self.assertEqual(str(request.url), "https://router.huggingface.co/v1/chat/completions")
+            self.assertEqual(request.headers["content-type"], "application/json")
+            self.assertEqual(request.headers["accept"], "application/json")
+            self.assertEqual(request.headers["authorization"], f"Bearer {secret}")
+            self.assertEqual(request.content, expected_request)
+        for response in responses:
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(
+                response.json(),
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "PROVIDER",
+                        "message": "Hugging Face Router request failed",
+                        "details": {"upstream_status": 400},
+                    },
+                    "exit_code": 1,
+                },
+            )
+
+        request_logs = [entry for entry in logs if entry["type"] == "llm_request"]
+        self.assertEqual(len(request_logs), len(bodies))
+        for entry in request_logs:
+            self.assertEqual(entry["message_bytes"], expected_message_bytes)
+            self.assertEqual(entry["tool_choice_kind"], "named")
+            self.assertEqual(entry["tool_schema_sha256"], expected_tool_hash)
+            self.assertEqual(entry["output_token_cap"], 73)
+
+        error_logs = [entry for entry in logs if entry["type"] == "gateway_error"]
+        self.assertEqual(len(error_logs), len(bodies))
+        for entry, expected in zip(error_logs, bodies, strict=True):
+            _, response_body, error_type, error_code, error_param, has_failed_generation, truncated = expected
+            self.assertEqual(entry["upstream"], {
+                "status": 400,
+                "error_type": error_type,
+                "error_code": error_code,
+                "error_param": error_param,
+                "has_failed_generation": has_failed_generation,
+                "sample_bytes": min(len(response_body), 16 * 1024),
+                "sample_sha256": hashlib.sha256(response_body[: 16 * 1024]).hexdigest(),
+                "truncated": truncated,
+            })
+        rendered_logs = json.dumps(logs, separators=(",", ":"))
+        for forbidden in (canary, credential, secret, "Authorization", "Bearer"):
+            self.assertNotIn(forbidden, rendered_logs)
