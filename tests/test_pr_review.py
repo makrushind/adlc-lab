@@ -464,6 +464,16 @@ class PullRequestReviewLoopTests(unittest.TestCase):
             "-old\n"
         )
 
+    def _added_file_diff(self, path: str, line_count: int) -> str:
+        return (
+            f"diff --git a/{path} b/{path}\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            f"+++ b/{path}\n"
+            f"@@ -0,0 +1,{line_count} @@\n"
+            + "+x\n" * line_count
+        )
+
     def _exercise(
         self,
         *,
@@ -472,6 +482,7 @@ class PullRequestReviewLoopTests(unittest.TestCase):
         search: object | None = None,
         lint: object | None = None,
         tools: tuple[str, ...] = ("search_repo", "lint_pr"),
+        diff: str | None = None,
     ) -> tuple[int, list[dict[str, object]], list[dict[str, object]], _ReviewSession, list[str]]:
         ReviewPaths, run_review = self._review_api()
 
@@ -479,7 +490,7 @@ class PullRequestReviewLoopTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 diff_path = root / "pr.diff"
-                diff_path.write_text(self._diff(), encoding="utf-8")
+                diff_path.write_text(self._diff() if diff is None else diff, encoding="utf-8")
                 order: list[str] = []
                 llm_requests: list[dict[str, object]] = []
                 first_document = first if first is not None else {
@@ -628,3 +639,104 @@ class PullRequestReviewLoopTests(unittest.TestCase):
         with mock.patch.object(__main__, "run_pr_review", return_value=0) as run:
             self.assertEqual(__main__.main(["pr-review"], output=output), 0)
         run.assert_called_once_with(output=output)
+
+    def test_lint_preflight_accepts_exact_caps_and_rejects_overages_before_boundaries(self) -> None:
+        exactly_100_targets = "".join(self._added_file_diff(f"pkg/{number}.py", 1) for number in range(100))
+        exactly_10_000_lines = self._added_file_diff("large.py", 10_000)
+        for name, document, target_count, line_count in (
+            ("target edge", exactly_100_targets, 100, 100),
+            ("line edge", exactly_10_000_lines, 1, 10_000),
+        ):
+            with self.subTest(name=name):
+                status, requests, events, session, order = self._exercise(diff=document, lint={"diagnostics": []})
+                self.assertEqual(status, 0)
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(order, ["LLM1", "search_repo", "lint_pr", "LLM2"])
+                lint_arguments = session.calls[1][1]
+                self.assertEqual(len(lint_arguments["targets"]), target_count)
+                self.assertEqual(sum(len(target["added_lines"]) for target in lint_arguments["targets"]), line_count)
+                self.assertEqual(events[-1]["verdict"], "pass")
+
+        over_100_targets = "".join(self._added_file_diff(f"pkg/{number}.py", 1) for number in range(101))
+        over_10_000_lines = self._added_file_diff("large.py", 10_001)
+        for name, document in (("target overage", over_100_targets), ("line overage", over_10_000_lines)):
+            with self.subTest(name=name):
+                status, requests, events, session, order = self._exercise(diff=document)
+                self.assertEqual(status, 1)
+                self.assertEqual(requests, [])
+                self.assertEqual(session.calls, [])
+                self.assertEqual(order, [])
+                self.assertEqual(events, [{"schema": 1, "type": "pr_review_error", "ok": False, "code": "POLICY", "stage": "diff"}])
+
+    def test_oversized_diff_is_rejected_before_any_file_read_or_boundary_call(self) -> None:
+        ReviewPaths, run_review = self._review_api()
+
+        async def exercise() -> tuple[int, list[dict[str, object]], list[str]]:
+            with tempfile.TemporaryDirectory() as directory:
+                diff_path = Path(directory) / "oversized.diff"
+                diff_path.write_bytes(b"x" * (512 * 1024 + 1))
+                calls: list[str] = []
+
+                async def post_llm(_: str, __: dict[str, object]) -> object:
+                    calls.append("llm")
+                    raise AssertionError("LLM must not be called")
+
+                @asynccontextmanager
+                async def open_mcp(_: str):
+                    calls.append("mcp")
+                    raise AssertionError("MCP must not be opened")
+                    yield
+
+                output = io.StringIO()
+                with (
+                    mock.patch.object(Path, "read_text", side_effect=AssertionError("oversized diff was read")),
+                    mock.patch.object(Path, "read_bytes", side_effect=AssertionError("oversized diff was read")),
+                ):
+                    status = await run_review(ReviewPaths(diff=diff_path), output, post_llm=post_llm, open_mcp=open_mcp)
+                return status, [json.loads(line) for line in output.getvalue().splitlines()], calls
+
+        status, events, calls = anyio.run(exercise)
+        self.assertEqual(status, 1)
+        self.assertEqual(calls, [])
+        self.assertEqual(events, [{"schema": 1, "type": "pr_review_error", "ok": False, "code": "POLICY", "stage": "diff"}])
+
+    def test_symlink_and_non_utf8_diffs_fail_closed_before_boundary_calls(self) -> None:
+        ReviewPaths, run_review = self._review_api()
+        for name in ("symlink", "non_utf8"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root / "target.diff"
+                target.write_bytes(self._diff().encode("utf-8") if name == "symlink" else b"\xff")
+                diff_path = root / "review.diff"
+                if name == "symlink":
+                    diff_path.symlink_to(target)
+                else:
+                    diff_path = target
+                calls: list[str] = []
+
+                async def post_llm(_: str, __: dict[str, object]) -> object:
+                    calls.append("llm")
+                    raise AssertionError("LLM must not be called")
+
+                @asynccontextmanager
+                async def open_mcp(_: str):
+                    calls.append("mcp")
+                    raise AssertionError("MCP must not be opened")
+                    yield
+
+                output = io.StringIO()
+                async def exercise() -> int:
+                    return await run_review(
+                        ReviewPaths(diff=diff_path),
+                        output,
+                        post_llm=post_llm,
+                        open_mcp=open_mcp,
+                    )
+
+                status = anyio.run(exercise)
+                self.assertEqual(status, 1)
+                self.assertEqual(calls, [])
+                self.assertEqual(
+                    [json.loads(line) for line in output.getvalue().splitlines()],
+                    [{"schema": 1, "type": "pr_review_error", "ok": False, "code": "POLICY", "stage": "diff"}],
+                )

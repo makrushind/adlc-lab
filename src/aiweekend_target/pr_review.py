@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import stat
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -34,10 +35,11 @@ from aiweekend_target.errors import ErrorCode, TargetError
 from aiweekend_target.lab.config import GATEWAY_BASE_URL, MCP_URL, MODEL_PAIR
 from aiweekend_target.lab.review_prepare import ReviewChange, parse_unified_diff
 from aiweekend_target.lab.trace import safe_preview
-from aiweekend_target.repo_rag.lint import LintTarget, validate_lint_response
+from aiweekend_target.repo_rag.lint import MAX_ADDED_LINES, MAX_TARGETS, LintTarget, validate_lint_response
 
 
 _REVIEW_TOOLS = ["search_repo", "lint_pr"]
+_MAX_DIFF_BYTES = 512 * 1024
 
 
 @dataclass(frozen=True)
@@ -75,7 +77,27 @@ def _event(event_type: str, **facts: object) -> dict[str, object]:
 
 def _read_diff(path: Path) -> tuple[str, tuple[ReviewChange, ...]]:
     try:
-        document = path.read_text(encoding="utf-8")
+        before = path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_size < 1
+            or before.st_size > _MAX_DIFF_BYTES
+        ):
+            raise _ReviewFailure(ErrorCode.POLICY.value, "diff")
+        data = path.read_bytes()
+        after = path.lstat()
+        identity_before = (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns)
+        identity_after = (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns)
+        if (
+            identity_after != identity_before
+            or len(data) != before.st_size
+            or len(data) > _MAX_DIFF_BYTES
+            or stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISREG(after.st_mode)
+        ):
+            raise _ReviewFailure(ErrorCode.POLICY.value, "diff")
+        document = data.decode("utf-8")
         changes = parse_unified_diff(document)
     except TargetError as error:
         raise _ReviewFailure(error.code.value, "diff") from error
@@ -85,11 +107,17 @@ def _read_diff(path: Path) -> tuple[str, tuple[ReviewChange, ...]]:
 
 
 def _lint_targets(changes: tuple[ReviewChange, ...]) -> list[LintTarget]:
-    return [
-        {"path": change.path, "added_lines": list(change.added_lines)}
-        for change in changes
-        if not change.deleted and change.path.endswith(".py")
-    ]
+    targets: list[LintTarget] = []
+    added_line_count = 0
+    for change in changes:
+        if change.deleted or not change.path.endswith(".py"):
+            continue
+        added_lines = list(change.added_lines)
+        targets.append({"path": change.path, "added_lines": added_lines})
+        added_line_count += len(added_lines)
+        if len(targets) > MAX_TARGETS or added_line_count > MAX_ADDED_LINES:
+            raise _ReviewFailure(ErrorCode.POLICY.value, "diff")
+    return targets
 
 
 def _document(response: object) -> dict[str, object]:
