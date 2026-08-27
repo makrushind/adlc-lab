@@ -116,6 +116,12 @@ docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml run --rm agen
 Первая команда создаёт отфильтрованный снимок checkout, diff и RAG-индекс в
 именованных volumes. Снимок сохраняется после завершения контейнера и
 используется следующими командами; повторный `prepare-review` заменяет его.
+В PR-review override у `reset`, `repo-rag` и `agent` отключено только SELinux
+process-label разделение: Docker Compose 2.29.2 не передаёт `:z` для named
+volumes в Podman, иначе следующий контейнер не может прочитать подготовленный
+снимок. Сервисы остаются non-root; checkout и diff доступны read-only только
+offline-роли `reset`, а прежние ограничения networks, secrets и mounts не
+меняются.
 Последняя команда печатает JSONL, а при завершённом протоколе её последняя
 строка имеет вид:
 

@@ -180,6 +180,15 @@ jobs:
               raise SystemExit("PR review input bind mismatch")
           if pr_review["services"]["repo-rag"].get("environment") != {"ADLC_PR_REVIEW_MODE": "1"}:
               raise SystemExit("PR review mode environment mismatch")
+          expected_review_security = {
+              name: [*base["services"][name].get("security_opt", []), "label=disable"]
+              for name in ("reset", "repo-rag", "agent")
+          }
+          if {
+              name: pr_review["services"][name].get("security_opt", [])
+              for name in expected_review_security
+          } != expected_review_security:
+              raise SystemExit("PR review shared-volume SELinux compatibility mismatch")
 
           expected_review_named_mounts = {
               ("reset", "workspace", "/target/workspace"): False,
@@ -211,8 +220,8 @@ jobs:
                   raise SystemExit(f"PR review named mount access mismatch: {key!r}")
               if review_mount.get("read_only", False) != base_mount.get("read_only", False):
                   raise SystemExit(f"PR review named mount changed access: {key!r}")
-              if review_mount.get("bind", {}).get("selinux") != "z":
-                  raise SystemExit(f"PR review named mount SELinux mode mismatch: {key!r}")
+              if review_mount.get("bind"):
+                  raise SystemExit(f"PR review named mount has unsupported bind options: {key!r}")
 
           normalized_review = copy.deepcopy(pr_review)
           normalized_review["services"]["reset"]["volumes"] = [
@@ -221,19 +230,12 @@ jobs:
               if mount.get("type") != "bind"
           ]
           normalized_review["services"]["repo-rag"].pop("environment", None)
-          for service_name, source, target in expected_review_named_mounts:
-              mount = next(
-                  mount
-                  for mount in normalized_review["services"][service_name].get("volumes", [])
-                  if mount.get("type") == "volume"
-                  and mount.get("source") == source
-                  and mount.get("target") == target
+          for service_name in expected_review_security:
+              normalized_review["services"][service_name]["security_opt"] = copy.deepcopy(
+                  base["services"][service_name].get("security_opt", [])
               )
-              mount["bind"].pop("selinux")
-              if not mount["bind"]:
-                  mount.pop("bind")
           if normalized_review != base:
-              raise SystemExit("PR review overlay changes more than its two inputs, mode flag, and SELinux mount modes")
+              raise SystemExit("PR review overlay changes more than its two inputs, mode flag, and SELinux compatibility setting")
 
           root = Path(".")
           retired = "open" + "code"
