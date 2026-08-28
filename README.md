@@ -98,7 +98,7 @@ sequenceDiagram
     participant G as hf-gateway
     participant F as Hugging Face Router
 
-    Note over H,R: Host paths exposed only to offline reset
+    Note over H,R: PR checkout and diff paths exposed only to offline reset
     alt Fixed scenario
         H->>R: docker compose run --rm reset
     else PR checkout and diff
