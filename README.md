@@ -7,8 +7,8 @@ ADLC Lab — Compose-only учебная лаборатория безопасн
 
 | Режим | Для чего | Вход | Итог |
 | --- | --- | --- | --- |
-| Attack lab | Воспроизвести фиксированные учебные атаки | Встроенный сценарий и canary | 10 JSONL-событий и `lab_result` |
-| Local PR review | Проверить локальный Python PR | PR-head checkout и unified diff | 9 JSONL-событий и `pr_review_result` |
+| Attack lab | Воспроизвести фиксированные учебные атаки | Встроенный сценарий и canary | 10 JSONL events; the last is `lab_result` |
+| Local PR review | Проверить локальный Python PR | PR-head checkout и unified diff | 9 JSONL events; the last is `pr_review_result` |
 
 Сценарии намеренно уязвимы и содержат только учебные фиксированные canary, не
 реальные секреты. Во всех контейнерных командах используется `docker compose`;

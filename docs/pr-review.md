@@ -21,12 +21,11 @@ export PR_REVIEW_DIFF="/tmp/pr-review.diff"
 изменённые пути с checkout, отклоняет небезопасные/неподдерживаемые или
 несогласованные diff до обращения к внешней модели.
 
-Выполните точную последовательность:
+Выполните подготовку:
 
 ```bash
 docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml run --rm reset prepare-review
 docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml up -d --wait repo-rag hf-gateway
-docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml run --rm agent pr-review
 ```
 
 `prepare-review` заменяет прежний runtime-снимок в именованных volumes и
@@ -34,6 +33,14 @@ docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml run --rm agen
 `changed_files`. В нём находятся отфильтрованный checkout, нормализованный
 `pr.diff`, SQLite RAG index и baseline marker. `up --wait` подтверждает
 готовность `repo-rag` и `hf-gateway`.
+
+Через Hugging Face gateway внешней модели будут переданы raw либо bounded diff
+context, retrieved RAG fragments и lint diagnostics. Не запускайте review,
+если этот код или данные нельзя передавать этому провайдеру.
+
+```bash
+docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml run --rm agent pr-review
+```
 
 ## События и результат
 
@@ -66,14 +73,16 @@ docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml run --rm agen
 {"schema":1,"type":"pr_review_result","ok":true,"verdict":"block","diagnostics":[{"path":"app.py","line":12,"column":9,"rule":"ADLC001","severity":"high","message":"Avoid eval() on untrusted input"}],"report_preview":"..."}
 ```
 
-Обработанная ошибка состоит из единственной финальной строки следующей формы:
+При обработанной ошибке поток заканчивается `pr_review_error` следующей формы:
 
 ```json
 {"schema":1,"type":"pr_review_error","ok":false,"code":"POLICY","stage":"diff"}
 ```
 
 `stage` — `diff`, `llm`, `mcp` или `review`; `code` — нормализованная категория
-ошибки. Preview проходит redaction и ограничен 512 символами.
+ошибки. Ранее напечатанные `llm_*`/`mcp_*` события сохраняются; preflight/diff
+ошибки до внешних границ печатают только эту единственную строку. Preview
+проходит redaction и ограничен 512 символами.
 
 ## Доверительные границы и данные
 
@@ -83,8 +92,8 @@ docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml run --rm agen
   явного cleanup, даже после завершения review.
 - Gateway — единственный сервис с Hugging Face token и external egress. Через
   него внешнему провайдеру уходят raw или bounded diff context, RAG-фрагменты и
-  lint diagnostics. Redaction защищает локальный trace, но не отменяет уже
-  переданную моделью передачу кода.
+  lint diagnostics. Redaction защищает локальный trace, но не отменяет передачу
+  кода, уже отправленного внешней модели.
 - GitHub PR URL, GitHub API, Git checkout base/head внутри контейнеров и
   публикация review comments не поддерживаются.
 
