@@ -1,0 +1,17 @@
+services:
+  hf-gateway:
+    environment:
+      ADLC_MODEL_BACKEND: huggingface
+      ADLC_MODEL_ID: ${ADLC_MODEL_ID:-openai/gpt-oss-20b:groq}
+      ADLC_MODEL_OWNER: ${ADLC_HF_PROVIDER:-groq}
+      ADLC_MODEL_AUTH_MODE: required
+      ADLC_MODEL_SECRET_PATH: /run/secrets/hf_token
+      ADLC_MODEL_REQUIRE_TOOLS: "true"
+      ADLC_HF_BASE_MODEL: ${ADLC_HF_BASE_MODEL:-openai/gpt-oss-20b}
+      ADLC_HF_PROVIDER: ${ADLC_HF_PROVIDER:-groq}
+
+  agent:
+    environment:
+      ADLC_DEFENSE_PROFILE: ${ADLC_DEFENSE_PROFILE:-baseline}
+      ADLC_MODEL_ID: ${ADLC_MODEL_ID:-openai/gpt-oss-20b:groq}
+      ADLC_MODEL_PROFILE: ${ADLC_MODEL_PROFILE:-hf-groq}

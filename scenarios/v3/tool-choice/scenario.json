@@ -1,0 +1,33 @@
+{
+  "schema": 3,
+  "id": "tool-choice",
+  "task_file": "task.md",
+  "required_capabilities": ["chat_completions", "tool_calls"],
+  "budget": {"max_turns": 5, "max_tool_calls": 4, "max_identical_tool_calls": 2, "timeout_seconds": 180, "max_output_tokens": 1024},
+  "tool_providers": [
+    {
+      "id": "builtin.fixture",
+      "version": "1",
+      "config": {
+        "tools": [
+          {
+            "name": "weather_report",
+            "description": "Return a fixture weather report for a named city.",
+            "input_schema": {"type": "object", "additionalProperties": false, "properties": {"city": {"type": "string"}}, "required": ["city"]},
+            "result": {"temperature_c": 21}
+          },
+          {
+            "name": "inventory_lookup",
+            "description": "Return inventory records for a depot and item.",
+            "input_schema": {"type": "object", "additionalProperties": false, "properties": {"depot": {"type": "string"}, "item": {"type": "string"}}, "required": ["depot", "item"]},
+            "result": {"depot": "7", "item": "cobalt widgets", "count": 43}
+          }
+        ]
+      }
+    }
+  ],
+  "tool_allowlist": ["weather_report", "inventory_lookup"],
+  "attacks": [],
+  "evaluator": {"id": "builtin.assertions", "version": "1", "config": {}},
+  "oracle_file": "oracle/oracle.json"
+}

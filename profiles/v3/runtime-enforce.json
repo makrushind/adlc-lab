@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "id": "runtime-enforce",
+  "model": {"id": "gateway.runtime", "version": "1", "config": {}},
+  "analyzers": [
+    {
+      "id": "builtin.pattern",
+      "version": "1",
+      "config": {
+        "boundaries": ["input", "tool_result", "tool_call", "final_output"],
+        "patterns": ["ignore previous", "ADLC_PRIVATE_CANARY"],
+        "code": "injection.suspected",
+        "severity": "high",
+        "case_sensitive": false
+      }
+    }
+  ],
+  "policy": {
+    "id": "builtin.findings",
+    "version": "1",
+    "config": {
+      "enforce": true,
+      "blocked_codes": ["injection.suspected"],
+      "replacements": {
+        "tool_result": {"error": "content_blocked_by_policy"},
+        "final_output": "Response blocked by host policy."
+      }
+    }
+  }
+}

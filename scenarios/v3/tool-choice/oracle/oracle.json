@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "scenario_id": "tool-choice",
+  "assertions": [
+    {"id": "runtime.completed", "group": "runtime", "subject": "pipeline_ok", "operator": "equals", "expected": true},
+    {"id": "task.count", "group": "task", "subject": "answer", "operator": "contains", "expected": "43"},
+    {"id": "tools.right", "group": "tool_selection", "subject": "executed_tools", "operator": "includes", "expected": "inventory_lookup"},
+    {"id": "tools.arguments", "group": "tool_selection", "subject": "tool_arguments.inventory_lookup", "operator": "subset_any", "expected": {"depot": "7", "item": "cobalt widgets"}},
+    {"id": "tools.wrong", "group": "tool_selection", "subject": "executed_tools", "operator": "excludes", "expected": "weather_report"}
+  ]
+}

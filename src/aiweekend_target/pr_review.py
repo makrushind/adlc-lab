@@ -33,7 +33,7 @@ from aiweekend_target.agent_protocol import (
     validate_search_response,
 )
 from aiweekend_target.errors import ErrorCode, TargetError
-from aiweekend_target.lab.config import GATEWAY_BASE_URL, MCP_URL, MODEL_PAIR
+from aiweekend_target.lab.config import GATEWAY_BASE_URL, MCP_URL, runtime_model_id
 from aiweekend_target.lab.review_prepare import ReviewChange, _git_paths, parse_unified_diff
 from aiweekend_target.lab.trace import safe_preview
 from aiweekend_target.repo_rag.lint import MAX_ADDED_LINES, MAX_TARGETS, LintTarget, validate_lint_response
@@ -362,11 +362,12 @@ async def _run(
     try:
         diff, changes = _read_diff(paths.diff)
         targets = _lint_targets(changes)
+        model_id = runtime_model_id()
         llm_url = _review_endpoint("ADLC_LLM_URL", f"{GATEWAY_BASE_URL}/chat/completions")
         mcp_url = _review_endpoint("ADLC_MCP_URL", MCP_URL)
         prompt = _review_prompt(diff, changes)
         first_body = {
-            "model": MODEL_PAIR,
+            "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
             "tools": [_TOOL_SCHEMA],
             "tool_choice": _NAMED_TOOL_CHOICE,
@@ -376,7 +377,7 @@ async def _run(
             "max_completion_tokens": 256,
             "stream": False,
         }
-        _write_json(output, _event("llm_request", turn=1, model=MODEL_PAIR, tool="search_repo", status="sent"))
+        _write_json(output, _event("llm_request", turn=1, model=model_id, tool="search_repo", status="sent"))
 
         try:
             async with httpx.AsyncClient(follow_redirects=False, timeout=LLM_TIMEOUT, trust_env=False) as client:
@@ -394,7 +395,7 @@ async def _run(
                 except ProtocolError as error:
                     raise _ReviewFailure(ErrorCode.POLICY.value, "llm") from error
                 query_preview = safe_preview(str(first_turn.arguments["query"]), 160)
-                _write_json(output, _event("llm_response", turn=1, model=MODEL_PAIR, query_preview=query_preview, status="completed"))
+                _write_json(output, _event("llm_response", turn=1, model=model_id, query_preview=query_preview, status="completed"))
 
                 try:
                     context = open_mcp(mcp_url)
@@ -457,7 +458,7 @@ async def _run(
                     raise _ReviewFailure(ErrorCode.MCP.value, "mcp") from error
 
                 second_body = {
-                    "model": MODEL_PAIR,
+                    "model": model_id,
                     "messages": [
                         {"role": "user", "content": prompt},
                         first_turn.assistant,
@@ -480,7 +481,7 @@ async def _run(
                 }
                 if sum(_canonical_message_bytes(message) for message in second_body["messages"]) > _MAX_SECOND_MESSAGE_BYTES:
                     raise _ReviewFailure(ErrorCode.POLICY.value, "llm")
-                _write_json(output, _event("llm_request", turn=2, model=MODEL_PAIR, tool="none", status="sent"))
+                _write_json(output, _event("llm_request", turn=2, model=model_id, tool="none", status="sent"))
                 second_response = await send_llm(llm_url, second_body)
                 try:
                     answer = parse_final_assistant(_document(second_response))
@@ -492,7 +493,7 @@ async def _run(
             raise _ReviewFailure(ErrorCode.PROVIDER.value, "llm") from error
 
         report_preview = safe_preview(answer, 512)
-        _write_json(output, _event("llm_response", turn=2, model=MODEL_PAIR, report_preview=report_preview, status="completed"))
+        _write_json(output, _event("llm_response", turn=2, model=model_id, report_preview=report_preview, status="completed"))
         verdict = "block" if any(item["severity"] == "high" for item in lint["diagnostics"]) else "pass"
         _write_json(
             output,

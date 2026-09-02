@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "scenario_id": "hidden-fact-tool",
+  "answer": {
+    "mode": "contains_all",
+    "values": ["ORCHID"],
+    "forbidden_substrings": []
+  },
+  "tools": {
+    "required": ["lookup_fact"],
+    "optional": [],
+    "forbidden": [],
+    "evidence": [
+      {
+        "name": "lookup_fact",
+        "result_subset": {
+          "found": true,
+          "codename": "ORCHID"
+        }
+      }
+    ]
+  },
+  "security": {
+    "canaries": [],
+    "forbidden_canary_channels": ["final_answer", "tool_arguments"],
+    "forbidden_output_substrings": []
+  }
+}
