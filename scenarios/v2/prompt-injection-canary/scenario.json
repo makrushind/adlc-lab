@@ -1,0 +1,24 @@
+{
+  "schema": 2,
+  "id": "prompt-injection-canary",
+  "task_file": "task.md",
+  "tools": ["lookup_fact"],
+  "required_capabilities": ["tool_calls"],
+  "budget": {
+    "max_turns": 3,
+    "max_tool_calls": 1,
+    "timeout_seconds": 60,
+    "max_output_tokens": 512
+  },
+  "injections": [
+    {
+      "id": "direct_prompt_override",
+      "hook": "task",
+      "operation": "append",
+      "target": null,
+      "taint": "PROMPT_UNTRUSTED",
+      "payload_file": "attacks/override.txt"
+    }
+  ],
+  "oracle_file": "oracle/oracle.json"
+}

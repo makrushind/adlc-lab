@@ -45,6 +45,8 @@ jobs:
             docker compose -f compose.yaml -f "scenarios/${overlay}.compose.yaml" config --quiet
           done
           docker compose -f compose.yaml -f scenarios/pr-review.compose.yaml config --quiet
+          docker compose -f compose.yaml -f providers/huggingface.compose.yaml config --quiet
+          docker compose -f compose.yaml -f providers/lm-studio.compose.yaml config --quiet
 
       - name: Build the three native images once
         run: docker compose build
@@ -67,6 +69,8 @@ jobs:
             docker compose --profile tools -f compose.yaml -f "scenarios/${overlay}.compose.yaml" config --format json --no-path-resolution > "/tmp/adlc-${overlay}.json"
           done
           docker compose --profile tools -f compose.yaml -f scenarios/pr-review.compose.yaml config --format json --no-path-resolution > /tmp/adlc-pr-review.json
+          ADLC_MODEL_BASE_URL=https://attacker.example/v1 docker compose --profile tools -f compose.yaml -f providers/huggingface.compose.yaml config --format json --no-path-resolution > /tmp/adlc-huggingface.json
+          docker compose --profile tools -f compose.yaml -f providers/lm-studio.compose.yaml config --format json --no-path-resolution > /tmp/adlc-lm-studio.json
           python3 - <<'PY'
           import copy
           import json
@@ -76,6 +80,8 @@ jobs:
           base = json.loads(Path("/tmp/adlc-base.json").read_text(encoding="utf-8"))
           custom = json.loads(Path("/tmp/adlc-custom.json").read_text(encoding="utf-8"))
           pr_review = json.loads(Path("/tmp/adlc-pr-review.json").read_text(encoding="utf-8"))
+          huggingface = json.loads(Path("/tmp/adlc-huggingface.json").read_text(encoding="utf-8"))
+          lm_studio = json.loads(Path("/tmp/adlc-lm-studio.json").read_text(encoding="utf-8"))
           expected_scenarios = ("baseline", "rag-poisoning", "mcp-poisoning", "llm-injection", "custom")
           resolved_scenarios = {
               scenario: json.loads(Path(f"/tmp/adlc-{scenario}.json").read_text(encoding="utf-8"))
@@ -236,6 +242,44 @@ jobs:
               )
           if normalized_review != base:
               raise SystemExit("PR review overlay changes more than its two inputs, mode flag, and SELinux compatibility setting")
+
+          local_gateway = lm_studio["services"]["hf-gateway"]
+          local_agent = lm_studio["services"]["agent"]
+          hf_gateway = huggingface["services"]["hf-gateway"]
+          if hf_gateway.get("environment") != {
+              "ADLC_HF_BASE_MODEL": "openai/gpt-oss-20b",
+              "ADLC_HF_PROVIDER": "groq",
+              "ADLC_MODEL_AUTH_MODE": "required",
+              "ADLC_MODEL_BACKEND": "huggingface",
+              "ADLC_MODEL_ID": "openai/gpt-oss-20b:groq",
+              "ADLC_MODEL_OWNER": "groq",
+              "ADLC_MODEL_REQUIRE_TOOLS": "true",
+              "ADLC_MODEL_SECRET_PATH": "/run/secrets/hf_token",
+          }:
+              raise SystemExit("Hugging Face profile or pinned route mismatch")
+          if local_gateway.get("secrets"):
+              raise SystemExit("LM Studio gateway must not mount the Hugging Face credential")
+          if local_gateway.get("environment") != {
+              "ADLC_MODEL_AUTH_MODE": "none",
+              "ADLC_MODEL_BACKEND": "lmstudio",
+              "ADLC_MODEL_BASE_URL": "http://host.docker.internal:1234/v1",
+              "ADLC_MODEL_ID": "gemma-4-e4b-uncensored-hauhaucs-aggressive",
+              "ADLC_MODEL_OWNER": "lmstudio",
+              "ADLC_MODEL_REQUIRE_TOOLS": "true",
+          }:
+              raise SystemExit("LM Studio gateway profile mismatch")
+          if local_agent.get("environment") != {
+              "ADLC_DEFENSE_PROFILE": "baseline",
+              "ADLC_LLM_URL": "http://hf-gateway:8080/v1/chat/completions",
+              "ADLC_MCP_URL": "http://repo-rag:8000/mcp",
+              "ADLC_MODEL_ID": "gemma-4-e4b-uncensored-hauhaucs-aggressive",
+              "ADLC_MODEL_PROFILE": "lmstudio-local",
+          }:
+              raise SystemExit("LM Studio agent profile mismatch")
+          if local_agent.get("secrets") or set(local_agent.get("networks", {})) != {"internal"}:
+              raise SystemExit("LM Studio agent must remain credential-free and internal-only")
+          if not any("host.docker.internal" in item for item in local_gateway.get("extra_hosts", [])):
+              raise SystemExit("LM Studio gateway has no pinned host route")
 
           root = Path(".")
           retired = "open" + "code"

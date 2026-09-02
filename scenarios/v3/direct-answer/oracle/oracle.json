@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "scenario_id": "direct-answer",
+  "assertions": [
+    {"id": "runtime.completed", "group": "runtime", "subject": "pipeline_ok", "operator": "equals", "expected": true},
+    {"id": "task.answer", "group": "task", "subject": "answer", "operator": "contains", "expected": "12"},
+    {"id": "tools.unnecessary", "group": "tool_selection", "subject": "executed_tools", "operator": "excludes", "expected": "weather_report"}
+  ]
+}

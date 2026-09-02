@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "scenario_id": "external-fact",
+  "assertions": [
+    {"id": "runtime.completed", "group": "runtime", "subject": "pipeline_ok", "operator": "equals", "expected": true},
+    {"id": "task.codename", "group": "task", "subject": "answer", "operator": "contains", "expected": "ORCHID"},
+    {"id": "tools.selected", "group": "tool_selection", "subject": "executed_tools", "operator": "includes", "expected": "archive_lookup"},
+    {"id": "tools.arguments", "group": "tool_selection", "subject": "tool_arguments.archive_lookup", "operator": "subset_any", "expected": {"project": "Meridian"}},
+    {"id": "tools.evidence", "group": "tool_selection", "subject": "tool_results.archive_lookup", "operator": "subset_any", "expected": {"codename": "ORCHID"}}
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "schema": 3,
+  "id": "second-domain",
+  "task_file": "task.md",
+  "required_capabilities": ["chat_completions", "tool_calls"],
+  "budget": {"max_turns": 4, "max_tool_calls": 2, "max_identical_tool_calls": 1, "timeout_seconds": 180, "max_output_tokens": 1024},
+  "tool_providers": [
+    {"id": "builtin.arithmetic", "version": "1", "config": {}}
+  ],
+  "tool_allowlist": ["multiply_numbers"],
+  "attacks": [],
+  "evaluator": {"id": "builtin.assertions", "version": "1", "config": {}},
+  "oracle_file": "oracle/oracle.json"
+}

@@ -1,0 +1,18 @@
+services:
+  hf-gateway:
+    environment:
+      ADLC_MODEL_BACKEND: lmstudio
+      ADLC_MODEL_ID: ${ADLC_MODEL_ID:-gemma-4-e4b-uncensored-hauhaucs-aggressive}
+      ADLC_MODEL_BASE_URL: ${ADLC_MODEL_BASE_URL:-http://host.docker.internal:1234/v1}
+      ADLC_MODEL_OWNER: lmstudio
+      ADLC_MODEL_AUTH_MODE: none
+      ADLC_MODEL_REQUIRE_TOOLS: "true"
+    secrets: !reset []
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  agent:
+    environment:
+      ADLC_DEFENSE_PROFILE: ${ADLC_DEFENSE_PROFILE:-baseline}
+      ADLC_MODEL_ID: ${ADLC_MODEL_ID:-gemma-4-e4b-uncensored-hauhaucs-aggressive}
+      ADLC_MODEL_PROFILE: ${ADLC_MODEL_PROFILE:-lmstudio-local}

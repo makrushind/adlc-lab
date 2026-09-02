@@ -9,11 +9,41 @@ import httpx
 from aiweekend_target.__main__ import _health
 from aiweekend_target.errors import ErrorCode, TargetError
 from aiweekend_target.gateway.app import create_app
+from aiweekend_target.gateway.correlation import (
+    MODEL_REQUEST_ID_HEADER,
+    RUN_ID_HEADER,
+)
 from aiweekend_target.gateway.transport import _bounded_error_diagnostics, _upstream_error, probe_available
-from aiweekend_target.lab.config import MODEL_PAIR
+from aiweekend_target.lab.config import DEFAULT_MODEL_PROFILE, MODEL_PAIR
 
 
 class GatewayErrorTests(unittest.TestCase):
+    def test_gateway_liveness_command_uses_the_local_live_endpoint(self) -> None:
+        requested: list[str] = []
+
+        class Response:
+            status_code = 200
+
+            @staticmethod
+            def json() -> dict[str, object]:
+                return {"status": "live"}
+
+        class Client:
+            def __enter__(self) -> "Client":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def get(self, url: str) -> Response:
+                requested.append(url)
+                return Response()
+
+        with patch("aiweekend_target.__main__.httpx.Client", return_value=Client()):
+            _health("gateway-live")
+
+        self.assertEqual(requested, ["http://127.0.0.1:8080/health/live"])
+
     def test_forbidden_upstream_response_is_authentication_failure(self) -> None:
         self.assertEqual(_upstream_error(403).code, ErrorCode.AUTH)
 
@@ -181,6 +211,30 @@ class GatewayErrorTests(unittest.TestCase):
 
 
 class GatewayChatAsgiTests(unittest.TestCase):
+    def test_live_endpoint_does_not_contact_the_model_backend(self) -> None:
+        upstream_requests: list[httpx.Request] = []
+
+        async def upstream(request: httpx.Request) -> httpx.Response:
+            upstream_requests.append(request)
+            return httpx.Response(500)
+
+        async def exercise() -> httpx.Response:
+            app = create_app(
+                profile=DEFAULT_MODEL_PROFILE,
+                transport=httpx.MockTransport(upstream),
+            )
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway"
+            ) as client:
+                return await client.get("/health/live")
+
+        response = asyncio.run(exercise())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "live"})
+        self.assertEqual(upstream_requests, [])
+
     def _post(self, content: bytes) -> httpx.Response:
         async def exercise() -> httpx.Response:
             app = create_app()
@@ -198,6 +252,31 @@ class GatewayChatAsgiTests(unittest.TestCase):
             response.json(),
             {"ok": False, "error": {"code": "POLICY", "message": "request body must be a JSON object", "details": None}, "exit_code": 1},
         )
+
+    def test_duplicate_and_oversized_chat_bodies_fail_before_upstream(self) -> None:
+        duplicate = self._post(
+            ('{"model":"' + MODEL_PAIR + '","model":"' + MODEL_PAIR + '"}').encode(
+                "utf-8"
+            )
+        )
+        self.assertEqual(duplicate.status_code, 400)
+        self.assertEqual(duplicate.json()["error"]["code"], "POLICY")
+
+        async def exercise() -> httpx.Response:
+            app = create_app()
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway"
+            ) as client:
+                return await client.post(
+                    "/v1/chat/completions",
+                    content=b"{}",
+                    headers={"content-length": str(512 * 1024 + 1)},
+                )
+
+        oversized = asyncio.run(exercise())
+        self.assertEqual(oversized.status_code, 400)
+        self.assertEqual(oversized.json()["error"]["code"], "POLICY")
 
     def test_invalid_chat_transport_return_returns_canonical_provider_document(self) -> None:
         async def invalid_send_chat(*_: object) -> object:
@@ -243,6 +322,73 @@ class GatewayChatAsgiTests(unittest.TestCase):
             response.json(),
             {"ok": False, "error": {"code": "PROVIDER", "message": "Hugging Face Router is unavailable", "details": None}, "exit_code": 1},
         )
+
+    def test_chat_correlation_is_logged_and_echoed_without_reaching_upstream(self) -> None:
+        logs: list[dict[str, object]] = []
+        upstream_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            upstream_requests.append(request)
+            return httpx.Response(
+                200,
+                json={"model": MODEL_PAIR, "choices": []},
+            )
+
+        async def exercise() -> httpx.Response:
+            app = create_app(
+                transport=httpx.MockTransport(handler), trace_sink=logs.append
+            )
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            with patch(
+                "aiweekend_target.gateway.app.read_secret", return_value="placeholder"
+            ):
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://gateway"
+                ) as client:
+                    return await client.post(
+                        "/v1/chat/completions",
+                        json={"model": MODEL_PAIR, "messages": []},
+                        headers={
+                            RUN_ID_HEADER: "run-correlation-test",
+                            MODEL_REQUEST_ID_HEADER: "model-0001-0001",
+                        },
+                    )
+
+        response = asyncio.run(exercise())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers[RUN_ID_HEADER], "run-correlation-test")
+        self.assertEqual(
+            response.headers[MODEL_REQUEST_ID_HEADER], "model-0001-0001"
+        )
+        self.assertEqual(len(upstream_requests), 1)
+        self.assertNotIn(RUN_ID_HEADER, upstream_requests[0].headers)
+        self.assertNotIn(MODEL_REQUEST_ID_HEADER, upstream_requests[0].headers)
+        model_logs = [
+            item for item in logs if item["type"] in {"llm_request", "llm_response"}
+        ]
+        self.assertEqual(len(model_logs), 2)
+        for item in model_logs:
+            self.assertEqual(item["run_id"], "run-correlation-test")
+            self.assertEqual(item["model_request_id"], "model-0001-0001")
+
+    def test_chat_rejects_unpaired_correlation_headers(self) -> None:
+        async def exercise() -> httpx.Response:
+            app = create_app()
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway"
+            ) as client:
+                return await client.post(
+                    "/v1/chat/completions",
+                    json={"model": MODEL_PAIR, "messages": []},
+                    headers={RUN_ID_HEADER: "run-without-request-id"},
+                )
+
+        response = asyncio.run(exercise())
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "POLICY")
 
     def test_pathological_digit_only_content_length_returns_canonical_error_without_reading_body(self) -> None:
         delivered: list[int] = []

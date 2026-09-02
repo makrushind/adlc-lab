@@ -45,6 +45,7 @@ CMD ["hf-gateway"]
 FROM runtime-python AS agent-runtime
 
 COPY --chown=10001:10001 scenarios /opt/adlc/scenarios
+COPY --chown=10001:10001 profiles /opt/adlc/profiles
 USER 10001:10001
 ENTRYPOINT ["python", "-m", "aiweekend_target"]
 CMD ["agent"]

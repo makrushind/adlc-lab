@@ -1,0 +1,15 @@
+{
+  "schema": 2,
+  "id": "no-tool-answer",
+  "task_file": "task.md",
+  "tools": ["lookup_fact"],
+  "required_capabilities": ["tool_calls"],
+  "budget": {
+    "max_turns": 3,
+    "max_tool_calls": 1,
+    "timeout_seconds": 60,
+    "max_output_tokens": 512
+  },
+  "injections": [],
+  "oracle_file": "oracle/oracle.json"
+}

@@ -70,7 +70,7 @@ services:
     entrypoint: [python, -m, aiweekend_target]
     command: [hf-gateway]
     healthcheck:
-      test: [CMD, python, -m, aiweekend_target, health, hf-gateway]
+      test: [CMD, python, -m, aiweekend_target, health, gateway-live]
       interval: 5s
       timeout: 5s
       retries: 20

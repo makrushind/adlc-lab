@@ -26,7 +26,7 @@ from aiweekend_target.agent_protocol import (
     validate_search_response,
 )
 from aiweekend_target.errors import ErrorCode, classify_upstream_status, match_gateway_error
-from aiweekend_target.lab.config import GATEWAY_BASE_URL, MCP_URL, MODEL_PAIR
+from aiweekend_target.lab.config import GATEWAY_BASE_URL, MCP_URL, runtime_model_id
 from aiweekend_target.lab.trace import CANARIES, TraceObserver, canaries_in, safe_preview
 from aiweekend_target.repo_rag.types import SearchResponse
 
@@ -199,18 +199,19 @@ async def _run(
         task = _read_task(paths.task)
         scenario = _scenario_id(paths.scenario_marker)
         observer = TraceObserver(scenario)
+        model_id = runtime_model_id()
         llm_url = _endpoint("ADLC_LLM_URL", f"{GATEWAY_BASE_URL}/chat/completions")
         mcp_url = _endpoint("ADLC_MCP_URL", MCP_URL)
         prompt = f"Scenario: {scenario}\nTask: {task}"
         _write_json(output, observer.emit("prompt", stage="prompt", prompt_chars=len(prompt), status="prepared", canaries=canaries_in(prompt, allowed=CANARIES[2:])))
         first_body = {
-            "model": MODEL_PAIR,
+            "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
             "tools": [_TOOL_SCHEMA],
             "tool_choice": _NAMED_TOOL_CHOICE,
             "stream": False,
         }
-        _write_json(output, observer.emit("llm_request", turn=1, model=MODEL_PAIR, tool=TOOL_NAME, status="sent"))
+        _write_json(output, observer.emit("llm_request", turn=1, model=model_id, tool=TOOL_NAME, status="sent"))
         try:
             async with httpx.AsyncClient(follow_redirects=False, timeout=LLM_TIMEOUT, trust_env=False) as client:
                 if post_llm is None:
@@ -224,7 +225,7 @@ async def _run(
                     first_turn = parse_first_tool_turn(first)
                 except ProtocolError as error:
                     raise _AgentFailure("POLICY", "llm") from error
-                _write_json(output, observer.emit("tool_call", turn=1, model=MODEL_PAIR, tool=TOOL_NAME, query_preview=safe_preview(str(first_turn.arguments["query"]), 160), status="accepted"))
+                _write_json(output, observer.emit("tool_call", turn=1, model=model_id, tool=TOOL_NAME, query_preview=safe_preview(str(first_turn.arguments["query"]), 160), status="accepted"))
                 _write_json(output, observer.emit("rag", stage="rag", query_preview=safe_preview(str(first_turn.arguments["query"]), 160), status="prepared", canaries=canaries_in(first_turn.arguments, allowed=CANARIES[:2])))
                 _write_json(output, observer.emit("mcp_request", tool=TOOL_NAME, query_preview=safe_preview(str(first_turn.arguments["query"]), 160), status="sent"))
                 search = await mcp_search(mcp_url, first_turn.arguments)
@@ -235,7 +236,7 @@ async def _run(
                 paths_preview = [safe_preview(str(item["path"]), 128) for item in search["results"][:10] if isinstance(item, dict)]
                 _write_json(output, observer.emit("mcp_result", stage="mcp", tool=TOOL_NAME, result_count=len(search["results"]), paths=paths_preview, status="completed", canaries=canaries_in(search, allowed=CANARIES[:2])))
                 second_body = {
-                    "model": MODEL_PAIR,
+                    "model": model_id,
                     "messages": [
                         {"role": "user", "content": prompt},
                         first_turn.assistant,
@@ -245,7 +246,7 @@ async def _run(
                     "tool_choice": "none",
                     "stream": False,
                 }
-                _write_json(output, observer.emit("llm_request", turn=2, model=MODEL_PAIR, tool=TOOL_NAME, status="sent"))
+                _write_json(output, observer.emit("llm_request", turn=2, model=model_id, tool=TOOL_NAME, status="sent"))
                 second_response = await send_llm(llm_url, second_body)
                 try:
                     answer = parse_final_assistant(_response_document(second_response, "llm"))
@@ -255,7 +256,7 @@ async def _run(
             raise
         except httpx.HTTPError as error:
             raise _AgentFailure("PROVIDER", "llm") from error
-        _write_json(output, observer.emit("llm_response", stage="llm", turn=2, model=MODEL_PAIR, status="completed"))
+        _write_json(output, observer.emit("llm_response", stage="llm", turn=2, model=model_id, status="completed"))
         _write_json(output, observer.emit("agent", stage="agent", status="completed", text_preview=safe_preview(answer, 512)))
         _write_json(output, observer.result(True))
         return 0

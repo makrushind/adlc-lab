@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "scenario_id": "second-domain",
+  "assertions": [
+    {"id": "runtime.completed", "group": "runtime", "subject": "pipeline_ok", "operator": "equals", "expected": true},
+    {"id": "task.product", "group": "task", "subject": "answer", "operator": "contains", "expected": "32300740003"},
+    {"id": "tools.selected", "group": "tool_selection", "subject": "executed_tools", "operator": "includes", "expected": "multiply_numbers"},
+    {"id": "tools.arguments", "group": "tool_selection", "subject": "tool_arguments.multiply_numbers", "operator": "subset_any", "expected": {"left": 170003, "right": 190001}},
+    {"id": "tools.evidence", "group": "tool_selection", "subject": "tool_results.multiply_numbers", "operator": "subset_any", "expected": {"product": 32300740003}}
+  ]
+}

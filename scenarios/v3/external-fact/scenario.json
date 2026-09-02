@@ -1,0 +1,27 @@
+{
+  "schema": 3,
+  "id": "external-fact",
+  "task_file": "task.md",
+  "required_capabilities": ["chat_completions", "tool_calls"],
+  "budget": {"max_turns": 4, "max_tool_calls": 3, "max_identical_tool_calls": 2, "timeout_seconds": 180, "max_output_tokens": 1024},
+  "tool_providers": [
+    {
+      "id": "builtin.fixture",
+      "version": "1",
+      "config": {
+        "tools": [
+          {
+            "name": "archive_lookup",
+            "description": "Look up project metadata in the laboratory archive.",
+            "input_schema": {"type": "object", "additionalProperties": false, "properties": {"project": {"type": "string"}}, "required": ["project"]},
+            "result": {"found": true, "project": "Meridian", "codename": "ORCHID"}
+          }
+        ]
+      }
+    }
+  ],
+  "tool_allowlist": ["archive_lookup"],
+  "attacks": [],
+  "evaluator": {"id": "builtin.assertions", "version": "1", "config": {}},
+  "oracle_file": "oracle/oracle.json"
+}

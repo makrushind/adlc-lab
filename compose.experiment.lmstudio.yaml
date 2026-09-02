@@ -1,0 +1,72 @@
+name: adlc-experiment-local
+
+services:
+  model-gateway:
+    image: adlc-lab-model-gateway:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: hf-gateway
+    pull_policy: never
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m"]
+    networks: [internal, host-access]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment:
+      ADLC_MODEL_BACKEND: lmstudio
+      ADLC_MODEL_ID: ${ADLC_MODEL_ID:-gemma-4-e4b-uncensored-hauhaucs-aggressive}
+      ADLC_MODEL_BASE_URL: ${ADLC_MODEL_BASE_URL:-http://host.docker.internal:1234/v1}
+      ADLC_MODEL_AUTH_MODE: none
+      ADLC_MODEL_REQUIRE_TOOLS: "true"
+    entrypoint: [python, -m, aiweekend_target]
+    command: [model-gateway]
+    healthcheck:
+      test: [CMD, python, -m, aiweekend_target, health, gateway-live]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: "no"
+
+  experiment:
+    image: adlc-lab-agent:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: agent-runtime
+    pull_policy: never
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m"]
+    networks: [internal]
+    environment:
+      ADLC_LLM_URL: http://model-gateway:8080/v1/chat/completions
+      ADLC_MODEL_ID: ${ADLC_MODEL_ID:-gemma-4-e4b-uncensored-hauhaucs-aggressive}
+      ADLC_MODEL_PROFILE: lmstudio
+      ADLC_ARTIFACT_ROOT: /artifacts
+    volumes:
+      - type: bind
+        source: ./.lab/artifacts
+        target: /artifacts
+        bind:
+          create_host_path: true
+    entrypoint: [python, -m, aiweekend_target]
+    command: [experiment, run, "${ADLC_SCENARIO:-direct-answer}", "${ADLC_DEFENSE_PROFILE:-runtime-observe}"]
+    depends_on:
+      model-gateway:
+        condition: service_healthy
+    restart: "no"
+
+networks:
+  internal:
+    internal: true
+  host-access: {}
