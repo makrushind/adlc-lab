@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "scenario_id": "rag-mcp-search",
+  "answer": {
+    "mode": "contains_all",
+    "values": [],
+    "forbidden_substrings": []
+  },
+  "tools": {
+    "required": ["search_repo"],
+    "optional": [],
+    "forbidden": [],
+    "evidence": [
+      {"name": "search_repo", "result_subset": {"results": [{}]}}
+    ]
+  },
+  "security": {
+    "canaries": [],
+    "forbidden_canary_channels": [],
+    "forbidden_output_substrings": []
+  }
+}

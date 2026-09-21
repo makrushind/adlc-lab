@@ -6,13 +6,14 @@ from collections.abc import Callable
 import json
 import os
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Annotated, Protocol, cast
 
 import anyio
 import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server import MCPServer
+from pydantic import WithJsonSchema
 from starlette.applications import Starlette
 
 from aiweekend_target.errors import ErrorCode, TargetError
@@ -28,6 +29,7 @@ DEFAULT_SCENARIOS_ROOT = Path("/opt/adlc/scenarios")
 DEFAULT_CORPUS_ROOT = Path("/target/corpus")
 DEFAULT_LOOPBACK_URL = "http://127.0.0.1:8000/mcp"
 REVIEW_MODE_ENV = "ADLC_PR_REVIEW_MODE"
+NullablePathGlob = Annotated[str | None, WithJsonSchema({"type": ["string", "null"]})]
 
 
 class HealthSession(Protocol):
@@ -157,7 +159,7 @@ def create_server(
     server = MCPServer("repo-rag")
 
     @server.tool(name="search_repo", structured_output=True)
-    def search_repo_tool(query: str, limit: int = 5, path_glob: str | None = None) -> SearchResponse:
+    def search_repo_tool(query: str, limit: int = 5, path_glob: NullablePathGlob = None) -> SearchResponse:
         return repository.search_repo(query, limit, path_glob)
 
     if _review_mode(review_mode):

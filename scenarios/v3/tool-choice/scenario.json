@@ -19,7 +19,23 @@
           {
             "name": "inventory_lookup",
             "description": "Return inventory records for a depot and item.",
-            "input_schema": {"type": "object", "additionalProperties": false, "properties": {"depot": {"type": "string"}, "item": {"type": "string"}}, "required": ["depot", "item"]},
+            "input_schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "depot": {
+                  "type": "string",
+                  "description": "Numeric depot identifier as a string, without the Depot prefix. For example, Depot 12 has the identifier 12.",
+                  "minLength": 1
+                },
+                "item": {
+                  "type": "string",
+                  "description": "Item name as written in the request.",
+                  "minLength": 1
+                }
+              },
+              "required": ["depot", "item"]
+            },
             "result": {"depot": "7", "item": "cobalt widgets", "count": 43}
           }
         ]
