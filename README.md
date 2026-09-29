@@ -1,5 +1,48 @@
 # ADLC Lab
 
+## Экспериментальный guardrail
+
+`src/aiweekend_target/guardrails/weak` — намеренно неполный компонент проверки
+контента и вызовов tools. Он использует несколько фраз и TF-IDF по встроенному
+`prototypes.json`; этот каталог примеров входит в пакет как ресурс детектора.
+Компонент не предназначен для production без доработки.
+
+Подключение явное, через Python API в доверенном коде сборки агента. Для уже
+настроенных `ModelProvider`, `ToolProvider` и публичного обработчика событий:
+
+```python
+from aiweekend_target.core.engine import AgentSession
+from aiweekend_target.guardrails.weak import GuardrailRunContext, create_pipeline
+
+async def guarded_session(provider, tools, event_sink):
+    context = GuardrailRunContext(
+        visible_tools=tuple(spec.name for spec in await tools.list_tools()),
+    )
+    pipeline = create_pipeline(context, mode="observe", event_sink=event_sink)
+    return AgentSession(
+        provider=provider, tools=tools, pipeline=pipeline, event_sink=event_sink,
+    )
+```
+
+Создавайте отдельный pipeline для каждой последовательной сессии. Он подключает
+парные analyzer/policy через штатный `BoundaryPipeline`. На `input` выполняется
+поиск сигналов; на `tool_call` проверяется только видимость имени tool, без
+проверки grants и аргументов. `tool_result` и `final_output` проходят адаптер,
+но содержимое пропускается без проверки; `model_request` и `model_output`
+этот компонент не анализирует. Размер события ограничен 64 КиБ.
+
+`mode="observe"` сохраняет findings, но разрешает содержимое;
+`mode="enforce"` применяет решение guardrail. Анализ одинаков в обоих режимах,
+ошибки адаптера останавливают pipeline в обоих. Публичные события содержат коды;
+raw payloads остаются в приватной памяти адаптера. Для отдельного приватного
+сборщика `create_pipeline` принимает `evidence_sink`.
+
+TF-IDF не учитывает отрыв от benign-примеров; самостоятельный `review()`
+объединяет сообщение и evidence, выбирает первый сигнал либо ответ по route.
+Полноценной проверки полномочий, утечек и защиты от prompt injection здесь нет.
+Глобальные настройки, существующие профили и обязательные проверки ядра
+не изменяются; компонент по умолчанию не подключён.
+
 ## Universal experiment harness (Scenario v3)
 
 Новый batch-стенд — это универсальное экспериментальное ядро, а не
